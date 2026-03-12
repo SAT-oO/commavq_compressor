@@ -24,3 +24,9 @@ target
 # Added by cargo
 
 /target
+compression_challenge_submission.zip
+compression_challenge_submission_decompressed/
+training/transition_topk_model.npz
+__pycache__/
+.venv/
+resource/dataset/
