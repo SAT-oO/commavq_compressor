@@ -26,7 +26,7 @@ target
 /target
 compression_challenge_submission.zip
 compression_challenge_submission_decompressed/
-training/transition_topk_model.npz
+training/temporal_mixture_model.npz
 __pycache__/
 .venv/
 resource/dataset/

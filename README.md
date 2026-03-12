@@ -1,56 +1,31 @@
-# video_compressor
+# CommaVQ Token Compressor
 
-First draft of a lossless compressor for the commaVQ token dataset.
+Lossless temporal compression pipeline for commaVQ video tokens, built to turn already-compressed autonomous-driving latents into a smaller, challenge-ready submission archive.
 
-## Challenge Contract
+## Why this project matters
 
-The official challenge in `commaai/commavq/compression` evaluates a submission by running:
+- Compresses long-horizon video-token datasets without changing a single token.
+- Combines sequence modeling, entropy coding, deterministic decoding, and evaluation-compatible packaging in one workflow.
+- Demonstrates practical ML systems engineering: model export, portable runtime inference, challenge integration, and reproducible compression experiments.
 
-```bash
-./compression/evaluate.sh path_to_submission.zip
-```
+## What it does
 
-The submission zip must contain:
+This project targets the `commaai/commavq` compression challenge, where the evaluator expects a single zip file containing:
 
 - compressed data for the first two dataset splits
-- a Python script named `decompress.py`
-- any extra project files needed by `decompress.py` that are not assumed to exist already
+- a bundled `decompress.py`
+- any additional source files needed to reconstruct the original token arrays exactly
 
-This repo is now aligned to that contract:
+The current implementation uses:
 
-- `compress.py` emits a single submission zip.
-- The zip contains `decompress.py`, `data.bin`, `model.npz`, and the shared codec modules.
-- `decompress.py` reconstructs extensionless NumPy files in `OUTPUT_DIR`, matching the evaluator expectation exactly.
-- `test/evaluate.sh` and `test/evaluate.py` are kept aligned with the official judging scripts rather than being repurposed as local build helpers.
-
-## Current Draft
-
-This repository now uses a hybrid layout:
-
-- `training/train_global.py`: trains a compact global transition model in Python.
-- `compress.py`: builds a submission zip with `data.bin`, `model.npz`, and a standalone `decompress.py`.
-- `decompress.py`: reconstructs extensionless NumPy token files compatible with `test/evaluate.py`.
-- `src/main.rs`: optional Rust helper for fast 10-bit pack/unpack used by the Python codec when a local binary is available.
-
-The current predictor is intentionally conservative for a first draft:
-
-- No intra-frame autoregression.
-- Predicts each token from the same token position in the previous frame plus global priors.
-- Encodes a top-k rank when the true token appears in the model shortlist.
-- Falls back to raw 10-bit escapes for misses.
-
-This is not expected to be leaderboard-optimal yet, but it creates a real end-to-end path that can be iterated toward stronger temporal models.
-
-## Files
-
-- `codec/dataset.py`: reads local `resource/dataset/*.tar.gz` shards directly.
-- `codec/model.py`: compact global transition-top-k model.
-- `codec/bits.py`: Python pack/unpack with optional Rust acceleration.
-- `codec/format.py`: shared binary format for compression and decompression.
+- a temporal mixture predictor trained over prior frames
+- arithmetic/range-style entropy coding via `constriction`
+- packed 10-bit storage for warmup context
+- a pure-Python decompression path that remains compatible with the official evaluator
 
 ## Quick Start
 
-Set up a Python environment with the project dependency:
+Create an environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -58,33 +33,38 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Train a first model on the local evaluation shards:
+Train the model:
 
 ```bash
 python3 training/train_global.py
 ```
 
-Build the optional Rust helper:
+Build a submission archive:
 
 ```bash
-cargo build --release
+python3 test/build_submission.py --train-if-missing
 ```
 
-Create a submission archive:
+Evaluate with the untouched challenge script:
 
 ```bash
-python3 test/build_submission.py --model training/transition_topk_model.npz
+bash test/evaluate.sh compression_challenge_submission.zip
 ```
 
-Run the repo evaluator:
+Get a fast small-sample estimate instead of full evaluation:
 
 ```bash
-test/evaluate.sh compression_challenge_submission.zip
+python3 estimate_sample.py --per-shard 32
 ```
 
-## Notes
+## Repository Map
 
-- The draft currently optimizes for a small, deterministic model and a working submission format.
-- `decompress.py` is pure Python on purpose so the submission does not depend on a Rust toolchain.
-- `test/build_submission.py` is the convenience entrypoint for local development; the evaluator remains the official challenge entrypoint.
-- The main next upgrade path is replacing the transition shortlist model with a stronger temporal predictor while keeping the same archive format.
+- `codec/`: binary format, shard reading, and 10-bit packing helpers
+- `model/`: temporal predictive model definition and exported runtime weights
+- `runtime/`: portable entropy-coding runtime helpers used by compression and decompression
+- `training/`: model training entrypoint
+- `test/`: official evaluation scripts plus a local submission builder
+
+## Technical Details
+
+The concise overview above is meant for fast reading. A deeper architecture and file-by-file walkthrough lives in `docs/TECHNICAL_OVERVIEW.md`.

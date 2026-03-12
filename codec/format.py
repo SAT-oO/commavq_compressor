@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import lzma
 import struct
 from pathlib import Path
 from typing import Iterable
@@ -9,16 +8,30 @@ from typing import Iterable
 import numpy as np
 
 from .bits import pack_u16_10bit, unpack_u16_10bit
-from .model import TransitionTopKModel
+from model.temporal import TemporalMixtureModel
+from runtime.entropy import CategoricalFrameDecoder, CategoricalFrameEncoder
 
 
-MAGIC = b"CVQTK001"
+MAGIC = b"CVQTM001"
+
+
+def _progress(iterable, *, total: int | None, desc: str | None, unit: str):
+    if desc is None:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(iterable, total=total, desc=desc, unit=unit)
+    except Exception:
+        return iterable
 
 
 def encode_records(
     records: Iterable[tuple[str, np.ndarray]],
-    model: TransitionTopKModel,
+    model: TemporalMixtureModel,
     use_rust: bool = True,
+    progress_desc: str | None = None,
+    progress_total: int | None = None,
 ) -> bytes:
     sample_shape = None
     frames = None
@@ -27,14 +40,14 @@ def encode_records(
     payload_chunks: list[bytes] = []
     segments = []
 
-    for name, tokens in records:
+    for name, tokens in _progress(records, total=progress_total, desc=progress_desc, unit="segment"):
         token_array = np.asarray(tokens, dtype=np.uint16)
         if sample_shape is None:
             sample_shape = token_array.shape
             frames = sample_shape[0]
             grid_shape = sample_shape[1:]
             positions = int(np.prod(grid_shape))
-            if positions != model.merged_topk.shape[0]:
+            if positions != model.position_probs.shape[0]:
                 raise ValueError("model position count does not match token shape")
         elif token_array.shape != sample_shape:
             raise ValueError("all token arrays must have the same shape")
@@ -42,39 +55,22 @@ def encode_records(
         flat_frames = token_array.reshape(frames, positions)
         warmup = flat_frames[: model.warmup_frames].reshape(-1)
 
-        previous = flat_frames[model.warmup_frames - 1]
-        rank_bytes = bytearray()
-        escapes = []
-        escape_count = 0
-        for frame in flat_frames[model.warmup_frames :]:
-            candidates = model.predict_topk(previous)
-            matches = candidates == frame[:, None]
-            hit_mask = matches.any(axis=1)
-            ranks = np.where(hit_mask, matches.argmax(axis=1), model.top_k).astype(np.uint8)
-            rank_bytes.extend(ranks.tobytes())
+        entropy_encoder = CategoricalFrameEncoder()
+        for frame_index in range(model.warmup_frames, frames):
+            entropy_encoder.encode_frame(
+                flat_frames[frame_index].astype(np.int32, copy=False),
+                model.predict_probabilities(flat_frames[:frame_index]),
+            )
 
-            if np.any(~hit_mask):
-                misses = frame[~hit_mask]
-                escapes.append(misses)
-                escape_count += int(misses.size)
-            previous = frame
+        warmup_blob = pack_u16_10bit(warmup, use_rust=use_rust)
+        entropy_blob = entropy_encoder.to_bytes()
 
-        warmup_blob = lzma.compress(pack_u16_10bit(warmup, use_rust=use_rust), preset=9)
-        rank_blob = lzma.compress(bytes(rank_bytes), preset=9)
-        if escapes:
-            escape_blob_raw = pack_u16_10bit(np.concatenate(escapes), use_rust=use_rust)
-        else:
-            escape_blob_raw = b""
-        escape_blob = lzma.compress(escape_blob_raw, preset=9)
-
-        payload_chunks.extend([warmup_blob, rank_blob, escape_blob])
+        payload_chunks.extend([warmup_blob, entropy_blob])
         segments.append(
             {
                 "name": name,
-                "escape_count": escape_count,
                 "warmup_len": len(warmup_blob),
-                "rank_len": len(rank_blob),
-                "escape_len": len(escape_blob),
+                "entropy_len": len(entropy_blob),
             }
         )
 
@@ -86,7 +82,7 @@ def encode_records(
         "grid_shape": list(grid_shape),
         "positions": positions,
         "warmup_frames": model.warmup_frames,
-        "top_k": model.top_k,
+        "lag_steps": model.lag_steps.tolist(),
         "segments": segments,
     }
     manifest_blob = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -102,8 +98,9 @@ def encode_records(
 
 def decode_records(
     payload: bytes,
-    model: TransitionTopKModel,
+    model: TemporalMixtureModel,
     use_rust: bool = False,
+    progress_desc: str | None = None,
 ) -> list[tuple[str, np.ndarray]]:
     if payload[: len(MAGIC)] != MAGIC:
         raise ValueError("invalid archive magic")
@@ -118,56 +115,36 @@ def decode_records(
     grid_shape = tuple(manifest["grid_shape"])
     positions = int(manifest["positions"])
     warmup_frames = int(manifest["warmup_frames"])
-    top_k = int(manifest["top_k"])
+    lag_steps = np.asarray(manifest["lag_steps"], dtype=np.int32)
 
-    if warmup_frames != model.warmup_frames or top_k != model.top_k:
+    if warmup_frames != model.warmup_frames or not np.array_equal(lag_steps, model.lag_steps):
         raise ValueError("payload metadata does not match loaded model")
 
     decoded: list[tuple[str, np.ndarray]] = []
 
-    for segment in manifest["segments"]:
+    for segment in _progress(
+        manifest["segments"],
+        total=len(manifest["segments"]),
+        desc=progress_desc,
+        unit="segment",
+    ):
         warmup_blob = payload[offset : offset + int(segment["warmup_len"])]
         offset += int(segment["warmup_len"])
-        rank_blob = payload[offset : offset + int(segment["rank_len"])]
-        offset += int(segment["rank_len"])
-        escape_blob = payload[offset : offset + int(segment["escape_len"])]
-        offset += int(segment["escape_len"])
+        entropy_blob = payload[offset : offset + int(segment["entropy_len"])]
+        offset += int(segment["entropy_len"])
 
         segment_warmup = unpack_u16_10bit(
-            lzma.decompress(warmup_blob),
+            warmup_blob,
             count=warmup_frames * positions,
-            use_rust=use_rust,
-        )
-        ranks = np.frombuffer(lzma.decompress(rank_blob), dtype=np.uint8)
-        segment_escape_count = int(segment["escape_count"])
-        segment_escapes = unpack_u16_10bit(
-            lzma.decompress(escape_blob),
-            count=segment_escape_count,
             use_rust=use_rust,
         )
 
         flat_frames = np.empty((frames, positions), dtype=np.uint16)
         flat_frames[:warmup_frames] = segment_warmup.reshape(warmup_frames, positions)
-        previous = flat_frames[warmup_frames - 1].copy()
-        local_rank_offset = 0
-        local_escape_offset = 0
-
+        entropy_decoder = CategoricalFrameDecoder(entropy_blob)
         for frame_index in range(warmup_frames, frames):
-            candidates = model.predict_topk(previous)
-            frame_ranks = ranks[local_rank_offset : local_rank_offset + positions]
-            local_rank_offset += positions
-
-            frame = np.empty((positions,), dtype=np.uint16)
-            hits = frame_ranks < top_k
-            if np.any(hits):
-                frame[hits] = candidates[np.arange(positions)[hits], frame_ranks[hits]]
-            if np.any(~hits):
-                miss_count = int((~hits).sum())
-                frame[~hits] = segment_escapes[local_escape_offset : local_escape_offset + miss_count]
-                local_escape_offset += miss_count
-
-            flat_frames[frame_index] = frame
-            previous = frame
+            probabilities = model.predict_probabilities(flat_frames[:frame_index])
+            flat_frames[frame_index] = entropy_decoder.decode_frame(probabilities).astype(np.uint16, copy=False)
 
         decoded.append((segment["name"], flat_frames.reshape((frames, *grid_shape)).astype(np.int16)))
 
