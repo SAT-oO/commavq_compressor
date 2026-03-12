@@ -12,7 +12,7 @@ from model.temporal import TemporalMixtureModel
 from runtime.entropy import CategoricalFrameDecoder, CategoricalFrameEncoder
 
 
-MAGIC = b"CVQTM001"
+MAGIC = b"CVQTM002"
 
 
 def _progress(iterable, *, total: int | None, desc: str | None, unit: str):
@@ -47,7 +47,7 @@ def encode_records(
             frames = sample_shape[0]
             grid_shape = sample_shape[1:]
             positions = int(np.prod(grid_shape))
-            if positions != model.mode_position_probs.shape[0]:
+            if positions != model.position_token_probs.shape[0]:
                 raise ValueError("model position count does not match token shape")
         elif token_array.shape != sample_shape:
             raise ValueError("all token arrays must have the same shape")
@@ -55,33 +55,27 @@ def encode_records(
         flat_frames = token_array.reshape(frames, positions)
         warmup = flat_frames[: model.warmup_frames].reshape(-1)
 
-        mode_encoder = CategoricalFrameEncoder()
-        novel_encoder = CategoricalFrameEncoder()
+        entropy_encoder = CategoricalFrameEncoder()
         for frame_index in range(model.warmup_frames, frames):
             context = flat_frames[:frame_index]
-            mode_probs, novel_token_probs = model.predict(context)
             current_frame = flat_frames[frame_index]
-            modes = model.copy_modes_for_frame(current_frame, context, model.lag_steps)
-            mode_encoder.encode_frame(modes.astype(np.int32, copy=False), mode_probs)
-
-            novel_mask = modes == model.novel_mode
-            if np.any(novel_mask):
-                novel_encoder.encode_frame(
-                    current_frame[novel_mask].astype(np.int32, copy=False),
-                    novel_token_probs[novel_mask],
-                )
+            base_probs = model.effective_token_probabilities(context)
+            for row_index in range(current_frame.size // 16):
+                start = row_index * 16
+                end = start + 16
+                above_row = None if row_index == 0 else current_frame[start - 16 : start]
+                row_probs = model.condition_row_probabilities(base_probs[start:end], above_row)
+                entropy_encoder.encode_frame(current_frame[start:end].astype(np.int32, copy=False), row_probs)
 
         warmup_blob = pack_u16_10bit(warmup, use_rust=use_rust)
-        mode_blob = mode_encoder.to_bytes()
-        novel_blob = novel_encoder.to_bytes()
+        entropy_blob = entropy_encoder.to_bytes()
 
-        payload_chunks.extend([warmup_blob, mode_blob, novel_blob])
+        payload_chunks.extend([warmup_blob, entropy_blob])
         segments.append(
             {
                 "name": name,
                 "warmup_len": len(warmup_blob),
-                "mode_len": len(mode_blob),
-                "novel_len": len(novel_blob),
+                "entropy_len": len(entropy_blob),
             }
         )
 
@@ -141,10 +135,8 @@ def decode_records(
     ):
         warmup_blob = payload[offset : offset + int(segment["warmup_len"])]
         offset += int(segment["warmup_len"])
-        mode_blob = payload[offset : offset + int(segment["mode_len"])]
-        offset += int(segment["mode_len"])
-        novel_blob = payload[offset : offset + int(segment["novel_len"])]
-        offset += int(segment["novel_len"])
+        entropy_blob = payload[offset : offset + int(segment["entropy_len"])]
+        offset += int(segment["entropy_len"])
 
         segment_warmup = unpack_u16_10bit(
             warmup_blob,
@@ -154,25 +146,16 @@ def decode_records(
 
         flat_frames = np.empty((frames, positions), dtype=np.uint16)
         flat_frames[:warmup_frames] = segment_warmup.reshape(warmup_frames, positions)
-        mode_decoder = CategoricalFrameDecoder(mode_blob)
-        novel_decoder = CategoricalFrameDecoder(novel_blob)
+        entropy_decoder = CategoricalFrameDecoder(entropy_blob)
         for frame_index in range(warmup_frames, frames):
-            context = flat_frames[:frame_index]
-            mode_probs, novel_token_probs = model.predict(context)
-            modes = mode_decoder.decode_frame(mode_probs).astype(np.int32, copy=False)
-
+            probabilities = model.effective_token_probabilities(flat_frames[:frame_index])
             frame = np.empty((positions,), dtype=np.uint16)
-            for lag_index, lag in enumerate(model.lag_steps.tolist()):
-                copy_mask = modes == lag_index
-                if np.any(copy_mask):
-                    frame[copy_mask] = flat_frames[frame_index - lag, copy_mask]
-
-            novel_mask = modes == model.novel_mode
-            if np.any(novel_mask):
-                frame[novel_mask] = novel_decoder.decode_frame(novel_token_probs[novel_mask]).astype(
-                    np.uint16, copy=False
-                )
-
+            for row_index in range(positions // 16):
+                start = row_index * 16
+                end = start + 16
+                above_row = None if row_index == 0 else frame[start - 16 : start]
+                row_probs = model.condition_row_probabilities(probabilities[start:end], above_row)
+                frame[start:end] = entropy_decoder.decode_frame(row_probs).astype(np.uint16, copy=False)
             flat_frames[frame_index] = frame
 
         decoded.append((segment["name"], flat_frames.reshape((frames, *grid_shape)).astype(np.int16)))
