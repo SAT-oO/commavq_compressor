@@ -6,9 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = ROOT / "training" / "transition_topk_model.npz"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from model.temporal import DEFAULT_LAGS
+
+
+DEFAULT_MODEL = ROOT / "training" / "temporal_mixture_model.npz"
 DEFAULT_ZIP = ROOT / "compression_challenge_submission.zip"
 
 
@@ -34,10 +39,17 @@ def parse_args() -> argparse.Namespace:
         help="Train the default model when the model path does not exist.",
     )
     parser.add_argument(
-        "--top-k",
+        "--lags",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_LAGS),
+        help="Temporal lags to use if training is needed.",
+    )
+    parser.add_argument(
+        "--report-top-k",
         type=int,
         default=8,
-        help="Top-k value to use if training is needed.",
+        help="Top-k shortlist size used only for reporting hit rate during training.",
     )
     parser.add_argument(
         "--limit",
@@ -73,18 +85,24 @@ def main() -> None:
                 "Run `python3 training/train_global.py` first or pass `--train-if-missing`."
             )
 
+        print("Step 1/2: training model")
         train_cmd = [
             sys.executable,
             str(ROOT / "training" / "train_global.py"),
             "--output",
             str(model_path),
-            "--top-k",
-            str(args.top_k),
+            "--report-top-k",
+            str(args.report_top_k),
         ]
+        if args.lags:
+            train_cmd.extend(["--lags", *[str(lag) for lag in args.lags]])
         if args.limit is not None:
             train_cmd.extend(["--limit", str(args.limit)])
         run(train_cmd)
+    else:
+        print("Step 1/2: using existing model")
 
+    print("Step 2/2: building submission archive")
     compress_cmd = [
         sys.executable,
         str(ROOT / "compress.py"),
