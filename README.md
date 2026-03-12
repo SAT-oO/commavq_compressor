@@ -18,7 +18,8 @@ This project targets the `commaai/commavq` compression challenge, where the eval
 
 The current implementation uses:
 
-- a temporal mixture predictor trained over prior frames
+- a hierarchical temporal predictor with explicit copy-mode detection
+- cluster-conditioned novel-token probability models over prior frames
 - arithmetic/range-style entropy coding via `constriction`
 - packed 10-bit storage for warmup context
 - a pure-Python decompression path that remains compatible with the official evaluator
