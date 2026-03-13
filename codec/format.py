@@ -12,7 +12,7 @@ from model.temporal import TemporalMixtureModel
 from runtime.entropy import CategoricalFrameDecoder, CategoricalFrameEncoder
 
 
-MAGIC = b"CVQTM002"
+MAGIC = b"CVQTM004"
 
 
 def _progress(iterable, *, total: int | None, desc: str | None, unit: str):
@@ -64,7 +64,7 @@ def encode_records(
                 start = row_index * 16
                 end = start + 16
                 above_row = None if row_index == 0 else current_frame[start - 16 : start]
-                row_probs = model.condition_row_probabilities(base_probs[start:end], above_row)
+                row_probs = model.condition_row_probabilities(base_probs[start:end], above_row, row_index)
                 entropy_encoder.encode_frame(current_frame[start:end].astype(np.int32, copy=False), row_probs)
 
         warmup_blob = pack_u16_10bit(warmup, use_rust=use_rust)
@@ -154,7 +154,7 @@ def decode_records(
                 start = row_index * 16
                 end = start + 16
                 above_row = None if row_index == 0 else frame[start - 16 : start]
-                row_probs = model.condition_row_probabilities(probabilities[start:end], above_row)
+                row_probs = model.condition_row_probabilities(probabilities[start:end], above_row, row_index)
                 frame[start:end] = entropy_decoder.decode_frame(row_probs).astype(np.uint16, copy=False)
             flat_frames[frame_index] = frame
 

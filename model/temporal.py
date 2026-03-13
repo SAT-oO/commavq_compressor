@@ -75,8 +75,10 @@ class TemporalMixtureModel:
             )
         if self.global_token_probs.shape != (VOCAB_SIZE,):
             raise ValueError(f"expected global_token_probs shape {(VOCAB_SIZE,)}, got {self.global_token_probs.shape}")
-        if self.up_token_probs.shape != (VOCAB_SIZE, VOCAB_SIZE):
-            raise ValueError(f"expected up_token_probs shape {(VOCAB_SIZE, VOCAB_SIZE)}, got {self.up_token_probs.shape}")
+        if self.up_token_probs.shape != (FRAME_ROWS, VOCAB_SIZE, VOCAB_SIZE):
+            raise ValueError(
+                f"expected up_token_probs shape {(FRAME_ROWS, VOCAB_SIZE, VOCAB_SIZE)}, got {self.up_token_probs.shape}"
+            )
         if self.row_token_probs.shape != (FRAME_ROWS, VOCAB_SIZE):
             raise ValueError(
                 f"expected row_token_probs shape {(FRAME_ROWS, VOCAB_SIZE)}, got {self.row_token_probs.shape}"
@@ -131,15 +133,12 @@ class TemporalMixtureModel:
         mode_count = lag_steps_arr.size + 1
         position_indices = np.arange(POSITIONS, dtype=np.int32)
         row_indices = position_indices // FRAME_COLS
-        up_positions = position_indices[position_indices >= FRAME_COLS]
-        up_sources = up_positions - FRAME_COLS
-
         mode_global_counts = np.zeros((mode_count,), dtype=np.uint64)
         mode_position_counts = np.zeros((POSITIONS, mode_count), dtype=np.uint32)
         mode_cluster_counts = np.zeros((CLUSTER_COUNT, mode_count), dtype=np.uint32)
 
         global_token_counts = np.zeros((VOCAB_SIZE,), dtype=np.uint64)
-        up_transition_counts = np.zeros((VOCAB_SIZE, VOCAB_SIZE), dtype=np.uint32)
+        up_transition_counts = np.zeros((FRAME_ROWS, VOCAB_SIZE, VOCAB_SIZE), dtype=np.uint32)
         row_token_counts = np.zeros((FRAME_ROWS, VOCAB_SIZE), dtype=np.uint32)
         position_token_counts = np.zeros((POSITIONS, VOCAB_SIZE), dtype=np.uint32)
         cluster_token_counts = np.zeros((CLUSTER_COUNT, VOCAB_SIZE), dtype=np.uint32)
@@ -151,10 +150,12 @@ class TemporalMixtureModel:
             frames = np.asarray(tokens, dtype=np.int64).reshape(tokens.shape[0], -1)
             if frames.shape[1] != POSITIONS:
                 raise ValueError(f"expected 128 positions, got {frames.shape[1]}")
-            if up_positions.size:
-                up_sources_tokens = frames[:, up_sources].reshape(-1)
-                up_target_tokens = frames[:, up_positions].reshape(-1)
-                np.add.at(up_transition_counts, (up_sources_tokens, up_target_tokens), 1)
+            for row_index in range(1, FRAME_ROWS):
+                row_start = row_index * FRAME_COLS
+                row_end = row_start + FRAME_COLS
+                sources = frames[:, row_start - FRAME_COLS : row_end - FRAME_COLS].reshape(-1)
+                targets = frames[:, row_start:row_end].reshape(-1)
+                np.add.at(up_transition_counts[row_index], (sources, targets), 1)
             if frames.shape[0] <= warmup_frames:
                 continue
 
@@ -371,15 +372,21 @@ class TemporalMixtureModel:
         mode_probs, novel_token_probs = self.predict(context_frames)
         effective = mode_probs[:, self.novel_mode][:, None] * novel_token_probs
         for lag_index, lag in enumerate(self.lag_steps.tolist()):
-            effective[np.arange(POSITIONS), context_frames[-lag]] += mode_probs[:, lag_index]
+            lag_tokens = context_frames[-lag]
+            effective[np.arange(POSITIONS), lag_tokens] += mode_probs[:, lag_index]
         return effective
 
-    def condition_row_probabilities(self, base_row_probs: np.ndarray, above_row_tokens: np.ndarray | None) -> np.ndarray:
+    def condition_row_probabilities(
+        self,
+        base_row_probs: np.ndarray,
+        above_row_tokens: np.ndarray | None,
+        row_index: int,
+    ) -> np.ndarray:
         conditioned = float(self.spatial_component_weights[0]) * np.asarray(base_row_probs, dtype=np.float32, copy=False)
         if above_row_tokens is not None:
             conditioned = conditioned + float(self.spatial_component_weights[1]) * self.up_token_probs.astype(
                 np.float32, copy=False
-            )[np.asarray(above_row_tokens, dtype=np.int64)]
+            )[row_index, np.asarray(above_row_tokens, dtype=np.int64)]
         row_sums = conditioned.sum(axis=1, keepdims=True)
         conditioned /= row_sums
         return conditioned.astype(np.float32, copy=False)
@@ -404,7 +411,7 @@ class TemporalMixtureModel:
                     start = row_index * FRAME_COLS
                     end = start + FRAME_COLS
                     above_row = None if row_index == 0 else current_frame[start - FRAME_COLS : start]
-                    row_probs = self.condition_row_probabilities(probabilities[start:end], above_row)
+                    row_probs = self.condition_row_probabilities(probabilities[start:end], above_row, row_index)
                     topk = np.argpartition(row_probs, -top_k, axis=1)[:, -top_k:]
                     hits += int((topk == current_frame[start:end][:, None]).any(axis=1).sum())
                     total += FRAME_COLS
@@ -443,13 +450,15 @@ class TemporalMixtureModel:
         spatial_component_weights = (
             payload["spatial_component_weights"].astype(np.float32, copy=False)
             if "spatial_component_weights" in payload
-            else np.asarray([1.0, 0.0], dtype=np.float32)
+            else np.asarray([0.96, 0.04], dtype=np.float32)
         )
         up_token_probs = (
             payload["up_token_probs"]
             if "up_token_probs" in payload
-            else np.repeat(global_token_probs[None, :], VOCAB_SIZE, axis=0)
+            else np.repeat(global_token_probs[None, None, :], FRAME_ROWS, axis=0)
         )
+        if up_token_probs.ndim == 2:
+            up_token_probs = np.repeat(up_token_probs[None, :, :], FRAME_ROWS, axis=0)
         return cls(
             mode_global_probs=payload["mode_global_probs"],
             mode_position_probs=payload["mode_position_probs"],
@@ -550,7 +559,7 @@ def _derive_spatial_weights(
     up_token_probs: np.ndarray,
 ) -> np.ndarray:
     del global_token_counts, up_transition_counts, global_token_probs, up_token_probs
-    return np.asarray([1.0, 0.0], dtype=np.float32)
+    return np.asarray([0.96, 0.04], dtype=np.float32)
 
 
 def _component_score(counts: np.ndarray, probs: np.ndarray, support_scale: float) -> float:
