@@ -8,11 +8,11 @@ from typing import Iterable
 import numpy as np
 
 from .bits import pack_u16_10bit, unpack_u16_10bit
-from model.temporal import TemporalMixtureModel
+from model.temporal import FRAME_COLS, POSITIONS, TemporalMixtureModel
 from runtime.entropy import CategoricalFrameDecoder, CategoricalFrameEncoder
 
 
-MAGIC = b"CVQTM004"
+MAGIC = b"CVQSP001"
 
 
 def _progress(iterable, *, total: int | None, desc: str | None, unit: str):
@@ -47,35 +47,47 @@ def encode_records(
             frames = sample_shape[0]
             grid_shape = sample_shape[1:]
             positions = int(np.prod(grid_shape))
-            if positions != model.position_token_probs.shape[0]:
-                raise ValueError("model position count does not match token shape")
+            if positions != POSITIONS:
+                raise ValueError("token shape does not match sparse lag codec geometry")
         elif token_array.shape != sample_shape:
             raise ValueError("all token arrays must have the same shape")
 
         flat_frames = token_array.reshape(frames, positions)
         warmup = flat_frames[: model.warmup_frames].reshape(-1)
 
-        entropy_encoder = CategoricalFrameEncoder()
+        mode_encoder = CategoricalFrameEncoder()
+        escaped_tokens: list[np.ndarray] = []
+        escaped_count = 0
         for frame_index in range(model.warmup_frames, frames):
-            context = flat_frames[:frame_index]
+            previous_frame = flat_frames[frame_index - model.primary_lag]
             current_frame = flat_frames[frame_index]
-            base_probs = model.effective_token_probabilities(context)
-            for row_index in range(current_frame.size // 16):
-                start = row_index * 16
-                end = start + 16
-                above_row = None if row_index == 0 else current_frame[start - 16 : start]
-                row_probs = model.condition_row_probabilities(base_probs[start:end], above_row, row_index)
-                entropy_encoder.encode_frame(current_frame[start:end].astype(np.int32, copy=False), row_probs)
+            candidates, mode_probs = model.lookup_candidates(previous_frame)
+            matches = candidates == current_frame[:, None]
+            hit_mask = matches.any(axis=1)
+            modes = np.full((positions,), model.top_k, dtype=np.int32)
+            modes[hit_mask] = matches[hit_mask].argmax(axis=1).astype(np.int32, copy=False)
+            mode_encoder.encode_frame(modes, mode_probs)
+
+            if np.any(~hit_mask):
+                escaped = current_frame[~hit_mask].astype(np.uint16, copy=False)
+                escaped_tokens.append(escaped)
+                escaped_count += escaped.size
 
         warmup_blob = pack_u16_10bit(warmup, use_rust=use_rust)
-        entropy_blob = entropy_encoder.to_bytes()
+        mode_blob = mode_encoder.to_bytes()
+        if escaped_tokens:
+            escape_blob = pack_u16_10bit(np.concatenate(escaped_tokens), use_rust=use_rust)
+        else:
+            escape_blob = b""
 
-        payload_chunks.extend([warmup_blob, entropy_blob])
+        payload_chunks.extend([warmup_blob, mode_blob, escape_blob])
         segments.append(
             {
                 "name": name,
                 "warmup_len": len(warmup_blob),
-                "entropy_len": len(entropy_blob),
+                "mode_len": len(mode_blob),
+                "escape_len": len(escape_blob),
+                "escape_count": escaped_count,
             }
         )
 
@@ -88,6 +100,7 @@ def encode_records(
         "positions": positions,
         "warmup_frames": model.warmup_frames,
         "lag_steps": model.lag_steps.tolist(),
+        "top_k": model.top_k,
         "segments": segments,
     }
     manifest_blob = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -121,12 +134,14 @@ def decode_records(
     positions = int(manifest["positions"])
     warmup_frames = int(manifest["warmup_frames"])
     lag_steps = np.asarray(manifest["lag_steps"], dtype=np.int32)
+    top_k = int(manifest["top_k"])
 
-    if warmup_frames != model.warmup_frames or not np.array_equal(lag_steps, model.lag_steps):
+    if positions != POSITIONS:
+        raise ValueError("payload position count does not match sparse lag codec geometry")
+    if warmup_frames != model.warmup_frames or not np.array_equal(lag_steps, model.lag_steps) or top_k != model.top_k:
         raise ValueError("payload metadata does not match loaded model")
 
     decoded: list[tuple[str, np.ndarray]] = []
-
     for segment in _progress(
         manifest["segments"],
         total=len(manifest["segments"]),
@@ -135,27 +150,39 @@ def decode_records(
     ):
         warmup_blob = payload[offset : offset + int(segment["warmup_len"])]
         offset += int(segment["warmup_len"])
-        entropy_blob = payload[offset : offset + int(segment["entropy_len"])]
-        offset += int(segment["entropy_len"])
+        mode_blob = payload[offset : offset + int(segment["mode_len"])]
+        offset += int(segment["mode_len"])
+        escape_blob = payload[offset : offset + int(segment["escape_len"])]
+        offset += int(segment["escape_len"])
 
         segment_warmup = unpack_u16_10bit(
             warmup_blob,
             count=warmup_frames * positions,
             use_rust=use_rust,
         )
+        escaped_tokens = unpack_u16_10bit(
+            escape_blob,
+            count=int(segment["escape_count"]),
+            use_rust=use_rust,
+        )
 
         flat_frames = np.empty((frames, positions), dtype=np.uint16)
         flat_frames[:warmup_frames] = segment_warmup.reshape(warmup_frames, positions)
-        entropy_decoder = CategoricalFrameDecoder(entropy_blob)
+        mode_decoder = CategoricalFrameDecoder(mode_blob)
+        escape_offset = 0
         for frame_index in range(warmup_frames, frames):
-            probabilities = model.effective_token_probabilities(flat_frames[:frame_index])
+            previous_frame = flat_frames[frame_index - model.primary_lag]
+            candidates, mode_probs = model.lookup_candidates(previous_frame)
+            modes = mode_decoder.decode_frame(mode_probs).astype(np.int32, copy=False)
             frame = np.empty((positions,), dtype=np.uint16)
-            for row_index in range(positions // 16):
-                start = row_index * 16
-                end = start + 16
-                above_row = None if row_index == 0 else frame[start - 16 : start]
-                row_probs = model.condition_row_probabilities(probabilities[start:end], above_row, row_index)
-                frame[start:end] = entropy_decoder.decode_frame(row_probs).astype(np.uint16, copy=False)
+            copied_mask = modes < model.top_k
+            if np.any(copied_mask):
+                frame[copied_mask] = candidates[copied_mask, modes[copied_mask]]
+            escaped_mask = ~copied_mask
+            if np.any(escaped_mask):
+                escaped_count = int(escaped_mask.sum())
+                frame[escaped_mask] = escaped_tokens[escape_offset : escape_offset + escaped_count]
+                escape_offset += escaped_count
             flat_frames[frame_index] = frame
 
         decoded.append((segment["name"], flat_frames.reshape((frames, *grid_shape)).astype(np.int16)))

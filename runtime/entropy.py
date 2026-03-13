@@ -27,9 +27,9 @@ class CategoricalFrameEncoder:
 
     def encode_frame(self, symbols: np.ndarray, probabilities: np.ndarray) -> None:
         self._encoder.encode(
-            np.asarray(symbols, dtype=np.int32),
+            np.ascontiguousarray(np.asarray(symbols, dtype=np.int32)),
             self._model_family,
-            np.asarray(probabilities, dtype=np.float32),
+            np.ascontiguousarray(np.asarray(probabilities, dtype=np.float32)),
         )
 
     def to_bytes(self) -> bytes:
@@ -59,7 +59,10 @@ class CategoricalFrameDecoder:
         self._decoder = constriction.stream.queue.RangeDecoder(compressed_words)
 
     def decode_frame(self, probabilities: np.ndarray) -> np.ndarray:
-        decoded = self._decoder.decode(self._model_family, np.asarray(probabilities, dtype=np.float32))
+        decoded = self._decoder.decode(
+            self._model_family,
+            np.ascontiguousarray(np.asarray(probabilities, dtype=np.float32)),
+        )
         return np.asarray(decoded, dtype=np.int32)
 
 

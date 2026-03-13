@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model.temporal import DEFAULT_LAGS
+from model.temporal import DEFAULT_LAGS, TemporalMixtureModel
 
 
 DEFAULT_MODEL = ROOT / "training" / "temporal_mixture_model.npz"
@@ -73,15 +73,24 @@ def run(command: list[str]) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def is_compatible_model(path: Path) -> bool:
+    try:
+        TemporalMixtureModel.load(path)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     args = parse_args()
     model_path = resolve_path(args.model)
     output_path = resolve_path(args.output)
 
-    if not model_path.exists():
+    needs_training = (not model_path.exists()) or (not is_compatible_model(model_path))
+    if needs_training:
         if not args.train_if_missing:
             raise SystemExit(
-                f"model not found: {model_path}. "
+                f"model missing or incompatible: {model_path}. "
                 "Run `python3 training/train_global.py` first or pass `--train-if-missing`."
             )
 
