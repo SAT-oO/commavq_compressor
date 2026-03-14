@@ -1,101 +1,276 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+Train NextFramePredictor on the commavq token dataset.
+
+Usage:
+    python training/train_global.py [--shards 0 38] [--epochs 5] [--batch 64]
+
+Saves:
+    resource/model.pt          (float32 state dict, best validation loss)
+    resource/global_freq.npy   (1024-element marginal frequency table)
+"""
 
 import argparse
+import math
+import multiprocessing
+import random
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
-from codec.dataset import count_shard_records, default_eval_shards, iter_shard_records
-from model.temporal import DEFAULT_LAGS, TemporalMixtureModel
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from model import (
+    CONTEXT_FRAMES,
+    TOKENS_PER_FRAME,
+    NextFramePredictor,
+    build_context,
+    save_model_f16,
+)
+
+# ---------------------------------------------------------------------------
+# Hyper-parameters
+# ---------------------------------------------------------------------------
+PAIRS_PER_SAMPLE = 12   # random (context, target) windows sampled per sample
+LR = 3e-4
+WEIGHT_DECAY = 1e-2
+WARMUP_FRAC = 0.05      # fraction of total steps used for LR warmup
+GRAD_CLIP = 1.0
+
+MODEL_SAVE = ROOT / "resource" / "model.pt"
+GLOBAL_FREQ_SAVE = ROOT / "resource" / "global_freq.npy"
+DATA_CACHE = ROOT / "resource" / "dataset"
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class TokenDataset(Dataset):
+    """
+    Generates (context_frames, target_frame) pairs from a list of token arrays.
+
+    tokens_list : list of (1200, 128) int16 numpy arrays
+    """
+
+    def __init__(self, tokens_list: list, pairs_per_sample: int = PAIRS_PER_SAMPLE):
+        self.tokens = tokens_list
+        self.pps    = pairs_per_sample
+
+    def __len__(self) -> int:
+        return len(self.tokens) * self.pps
+
+    def __getitem__(self, idx: int):
+        tokens = self.tokens[idx // self.pps]            # (1200, 128)
+        t      = random.randint(0, len(tokens) - 1)
+        ctx    = build_context(tokens, t).astype(np.int64)    # (T, 128)
+        target = tokens[t].astype(np.int64)                   # (128,)
+        return torch.from_numpy(ctx), torch.from_numpy(target)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a temporal mixture model for commaVQ.")
-    parser.add_argument(
-        "--shard",
-        action="append",
-        type=Path,
-        default=None,
-        help="Local dataset shard (.tar.gz). Can be passed multiple times.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional sample limit for faster iteration.",
-    )
-    parser.add_argument(
-        "--lags",
-        type=int,
-        nargs="+",
-        default=list(DEFAULT_LAGS),
-        help="Temporal lags to use as context frames.",
-    )
-    parser.add_argument(
-        "--report-top-k",
-        type=int,
-        default=8,
-        help="Top-k shortlist size used only for reporting hit rate.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("training/temporal_mixture_model.npz"),
-        help="Output model path.",
-    )
-    return parser.parse_args()
+# ---------------------------------------------------------------------------
+# LR schedule: linear warmup → cosine decay
+# ---------------------------------------------------------------------------
+
+def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
+    if step < warmup:
+        return base_lr * step / max(warmup, 1)
+    progress = (step - warmup) / max(total - warmup, 1)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def resolve_project_path(path: Path) -> Path:
-    return path if path.is_absolute() else ROOT / path
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = parse_args()
-    shard_paths = args.shard if args.shard else default_eval_shards(ROOT)
-    output_path = resolve_project_path(args.output)
-    print("Step 1/3: counting training records")
-    record_count = count_shard_records(shard_paths, limit=args.limit)
-    if record_count == 0:
-        raise SystemExit("no training records found")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shards",  type=int, nargs=2, default=[0, 38],
+                        metavar=("START", "END"),
+                        help="Half-open range of shards to train on (default: 0 38)")
+    parser.add_argument("--val-shards", type=int, nargs=2, default=[38, 40],
+                        metavar=("START", "END"),
+                        help="Shards held out for validation (default: 38 40)")
+    parser.add_argument("--epochs",  type=int,   default=5)
+    parser.add_argument("--batch",   type=int,   default=64)
+    parser.add_argument("--lr",      type=float, default=LR)
+    parser.add_argument("--workers", type=int,   default=min(4, multiprocessing.cpu_count()))
+    parser.add_argument("--device",  default="auto")
+    args = parser.parse_args()
 
-    print("Step 2/3: fitting temporal model")
-    model = TemporalMixtureModel.fit(
-        iter_shard_records(
-            shard_paths,
-            limit=args.limit,
-            progress_desc="Loading records for training",
-            progress_total=record_count,
-        ),
-        lag_steps=tuple(args.lags),
-        progress_desc="Training records",
-        progress_total=record_count,
+    # Device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+    print(f"Device: {device}")
+
+    # ---------------------------------------------------------------------------
+    # Load dataset
+    # ---------------------------------------------------------------------------
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        sys.exit("pip install datasets  (HuggingFace datasets library)")
+
+    train_shards = [f"data-{i:04d}.tar.gz" for i in range(*args.shards)]
+    val_shards   = [f"data-{i:04d}.tar.gz" for i in range(*args.val_shards)]
+
+    print(f"Loading train shards {args.shards[0]}–{args.shards[1]-1} …")
+    ds_train = load_dataset(
+        "commaai/commavq",
+        num_proc=multiprocessing.cpu_count(),
+        data_files={"train": train_shards},
+        cache_dir=str(DATA_CACHE),
+    )["train"]
+    print(f"  {len(ds_train):,} training samples")
+
+    print(f"Loading val shards {args.val_shards[0]}–{args.val_shards[1]-1} …")
+    ds_val = load_dataset(
+        "commaai/commavq",
+        num_proc=multiprocessing.cpu_count(),
+        data_files={"train": val_shards},
+        cache_dir=str(DATA_CACHE),
+    )["train"]
+    print(f"  {len(ds_val):,} validation samples")
+
+    # ---------------------------------------------------------------------------
+    # Preload token arrays + compute global token frequency table
+    # ---------------------------------------------------------------------------
+    print("Pre-loading token arrays and computing global frequency table …")
+    global_counts = np.zeros(1024, dtype=np.int64)
+
+    def load_tokens(ds, desc):
+        out = []
+        for i, ex in enumerate(ds):
+            t = np.array(ex["token.npy"], dtype=np.int16).reshape(1200, TOKENS_PER_FRAME)
+            out.append(t)
+            np.add.at(global_counts, t.ravel(), 1)
+            if (i + 1) % 5000 == 0:
+                print(f"  {desc}: {i+1}/{len(ds)}", end="\r", flush=True)
+        print()
+        return out
+
+    train_tokens = load_tokens(ds_train, "train")
+    val_tokens   = load_tokens(ds_val,   "val  ")
+
+    global_freq = global_counts.astype(np.float32) / global_counts.sum()
+    GLOBAL_FREQ_SAVE.parent.mkdir(parents=True, exist_ok=True)
+    np.save(GLOBAL_FREQ_SAVE, global_freq)
+    marginal_entropy = -(global_freq * np.log2(global_freq + 1e-12)).sum()
+    print(f"Global token entropy (marginal): {marginal_entropy:.2f} bits  →  "
+          f"{10/marginal_entropy:.2f}× compression with marginal model")
+
+    # ---------------------------------------------------------------------------
+    # Datasets / loaders
+    # ---------------------------------------------------------------------------
+    train_ds = TokenDataset(train_tokens, PAIRS_PER_SAMPLE)
+    val_ds   = TokenDataset(val_tokens,   PAIRS_PER_SAMPLE)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch, shuffle=True,
+        num_workers=args.workers, pin_memory=(device == "cuda"),
+        persistent_workers=(args.workers > 0),
     )
-    print("Step 3/3: measuring top-k hit rate")
-    hit_rate = model.topk_hit_rate(
-        iter_shard_records(
-            shard_paths,
-            limit=args.limit,
-            progress_desc="Loading records for hit-rate",
-            progress_total=record_count,
-        ),
-        top_k=args.report_top_k,
-        progress_desc="Hit-rate records",
-        progress_total=record_count,
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch, shuffle=False,
+        num_workers=args.workers, pin_memory=(device == "cuda"),
+        persistent_workers=(args.workers > 0),
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    model.save(output_path)
+    # ---------------------------------------------------------------------------
+    # Model + optimiser
+    # ---------------------------------------------------------------------------
+    model = NextFramePredictor().to(device)
+    print(f"Model parameters: {model.param_count():,}  "
+          f"(float16 size ≈ {model.param_count()*2/1e6:.1f} MB)")
 
-    print(f"records: {record_count}")
-    print(f"lags: {model.lag_steps.tolist()}")
-    print(f"warmup frames: {model.warmup_frames}")
-    print(f"top-{args.report_top_k} hit rate: {hit_rate:.4f}")
-    print(f"wrote: {output_path}")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    total_steps  = args.epochs * len(train_loader)
+    warmup_steps = max(1, int(total_steps * WARMUP_FRAC))
+
+    # ---------------------------------------------------------------------------
+    # Training loop
+    # ---------------------------------------------------------------------------
+    best_val_loss = float("inf")
+    global_step   = 0
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss, n_batches = 0.0, 0
+
+        for ctx, target in train_loader:
+            ctx    = ctx.to(device)     # (B, T, S)
+            target = target.to(device)  # (B, S)
+
+            # Update LR
+            lr = cosine_lr(global_step, total_steps, warmup_steps, args.lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+
+            logits = model(ctx)                         # (B, S, V)
+            loss   = criterion(
+                logits.reshape(-1, logits.shape[-1]),
+                target.reshape(-1),
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches  += 1
+            global_step += 1
+
+            if global_step % 500 == 0:
+                avg = epoch_loss / n_batches
+                print(f"  epoch {epoch}/{args.epochs}  step {global_step}  "
+                      f"train_loss={avg:.4f}  ({2**avg:.2f} bits/token)  lr={lr:.2e}")
+
+        train_loss = epoch_loss / max(n_batches, 1)
+
+        # Validation
+        model.eval()
+        val_loss, n_val = 0.0, 0
+        with torch.no_grad():
+            for ctx, target in val_loader:
+                ctx    = ctx.to(device)
+                target = target.to(device)
+                logits = model(ctx)
+                val_loss += criterion(
+                    logits.reshape(-1, logits.shape[-1]), target.reshape(-1)
+                ).item()
+                n_val += 1
+        val_loss /= max(n_val, 1)
+
+        bits_per_token = 2 ** val_loss
+        est_ratio      = 10.0 / bits_per_token
+        print(f"Epoch {epoch}/{args.epochs}  train={train_loss:.4f}  "
+              f"val={val_loss:.4f}  ({bits_per_token:.2f} bits/token → "
+              f"~{est_ratio:.2f}× compression)")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), MODEL_SAVE)
+            save_model_f16(model, str(MODEL_SAVE).replace(".pt", "_f16.pt"))
+            print(f"  ✓ saved to {MODEL_SAVE}")
+
+    print(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}  "
+          f"({2**best_val_loss:.2f} bits/token → ~{10/2**best_val_loss:.2f}× compression)")
 
 
 if __name__ == "__main__":

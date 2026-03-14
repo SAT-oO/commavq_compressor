@@ -1,113 +1,240 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+Compress commavq token sequences using a trained NextFramePredictor model.
+
+Usage:
+    python compress.py [--model resource/model.pt] [--output submission.zip]
+                       [--splits data-0000.tar.gz data-0001.tar.gz]
+
+The output zip contains:
+    decompress.py          – decompression entry-point
+    model.py               – model architecture
+    coder.py               – range-coding wrappers
+    model_weights.pt       – float16 model weights
+    global_freq.npy        – marginal token frequency table
+    compressed_data.pkl    – compressed bitstreams keyed by file_name
+"""
 
 import argparse
+import io
+import multiprocessing
+import os
+import pickle
+import sys
 import zipfile
 from pathlib import Path
+from typing import Dict, List
 
-from codec.dataset import count_shard_records, default_eval_shards, iter_shard_records
-from codec.format import encode_records
-from model.temporal import TemporalMixtureModel
+import numpy as np
+import torch
 
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
-SUBMISSION_FILES = [
-    "decompress.py",
-    "codec/bits.py",
-    "codec/format.py",
-    "model/temporal.py",
-    "runtime/entropy.py",
-]
+from coder import FrameEncoder
+from model import (
+    CONTEXT_FRAMES,
+    TOKENS_PER_FRAME,
+    NextFramePredictor,
+    build_context_batch,
+    load_model,
+    rebuild_from_f16,
+    save_model_f16,
+)
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a challenge-compatible commaVQ submission archive.")
-    parser.add_argument(
-        "--model",
-        type=Path,
-        default=Path("training/temporal_mixture_model.npz"),
-        help="Path to a trained predictor model exported by training/train_global.py",
-    )
-    parser.add_argument(
-        "--shard",
-        action="append",
-        type=Path,
-        default=None,
-        help="Local dataset shard (.tar.gz). Can be passed multiple times.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional sample limit for quick experiments.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("compression_challenge_submission.zip"),
-        help="Path to the submission zip to create.",
-    )
-    parser.add_argument(
-        "--no-rust",
-        action="store_true",
-        help="Disable the optional Rust bit-packing helper.",
-    )
-    return parser.parse_args()
+ENCODE_BATCH   = 128    # samples grouped per outer batch
+FRAME_CHUNK    = 64     # time-step chunks within one sample's inference
 
 
-def resolve_project_path(path: Path, repo_root: Path) -> Path:
-    return path if path.is_absolute() else repo_root / path
+# ---------------------------------------------------------------------------
+# Core compression routine
+# ---------------------------------------------------------------------------
 
+def _predict_all_frames(
+    tokens: np.ndarray,             # (1200, 128) int16 for one sample
+    model: NextFramePredictor,
+    device: str,
+    global_tile: np.ndarray,        # (128, 1024) float32
+) -> np.ndarray:
+    """
+    Run model once per sample, batching all 1200 time steps at once.
+    Returns (1200, 128, 1024) float32 probability arrays.
+    """
+    T_len = len(tokens)
+    batch = tokens[None]    # (1, T_len, 128)
+
+    # Build all context windows: (T_len, T, 128)
+    all_ctx = np.stack([build_context_batch(batch, t)[0] for t in range(T_len)])
+
+    all_probs = []
+    with torch.no_grad():
+        for start in range(0, T_len, FRAME_CHUNK):
+            end = min(start + FRAME_CHUNK, T_len)
+            x = torch.tensor(all_ctx[start:end].astype(np.int64), device=device)
+            logits = model(x)                               # (chunk, 128, 1024)
+            all_probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
+
+    probs_all = np.concatenate(all_probs, axis=0)          # (T_len, 128, 1024)
+    probs_all[0] = global_tile                              # override frame 0
+    return probs_all
+
+
+def compress_batch(
+    batch_tokens: np.ndarray,       # (B, 1200, 128) int16
+    model: NextFramePredictor,
+    global_probs: np.ndarray,       # (1024,) float32
+    device: str,
+) -> List[bytes]:
+    """
+    Compress B token sequences.  For each sample we run the model across
+    all 1200 time steps in one batched inference call, then entropy-code.
+    """
+    B, num_frames, _ = batch_tokens.shape
+
+    global_tile = np.broadcast_to(
+        global_probs[None, :], (TOKENS_PER_FRAME, len(global_probs))
+    ).astype(np.float32)
+
+    results = []
+    for i in range(B):
+        probs = _predict_all_frames(batch_tokens[i], model, device, global_tile)
+        enc = FrameEncoder()
+        for t in range(num_frames):
+            enc.encode_frame(batch_tokens[i, t], probs[t])
+        results.append(enc.to_bytes())
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = parse_args()
-    repo_root = Path(__file__).resolve().parent
-    shard_paths = args.shard if args.shard else default_eval_shards(repo_root)
-    model_path = resolve_project_path(args.model, repo_root)
-    output_path = resolve_project_path(args.output, repo_root)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",       default="resource/model.pt")
+    parser.add_argument("--global-freq", default="resource/global_freq.npy")
+    parser.add_argument("--data-cache",  default="resource/dataset")
+    parser.add_argument("--output",      default="submission.zip")
+    parser.add_argument("--splits", nargs="+",
+                        default=["data-0000.tar.gz", "data-0001.tar.gz"])
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args()
 
-    print("Step 1/4: loading model")
-    model = TemporalMixtureModel.load(model_path)
-    print("Step 2/4: counting records")
-    record_count = count_shard_records(shard_paths, limit=args.limit)
-    if record_count == 0:
-        raise SystemExit("no records found in the provided shards")
+    # Device selection
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+    print(f"Device: {device}")
 
-    print("Step 3/4: evaluating predictor hit rate")
-    hit_rate = model.topk_hit_rate(
-        iter_shard_records(
-            shard_paths,
-            limit=args.limit,
-            progress_desc="Loading records for hit-rate",
-            progress_total=record_count,
-        ),
-        progress_desc="Scoring records",
-        progress_total=record_count,
-    )
-    print("Step 4/4: encoding submission archive")
-    payload = encode_records(
-        iter_shard_records(
-            shard_paths,
-            limit=args.limit,
-            progress_desc="Loading records for encoding",
-            progress_total=record_count,
-        ),
-        model=model,
-        use_rust=not args.no_rust,
-        progress_desc="Encoding segments",
-        progress_total=record_count,
-    )
+    # Load model
+    print(f"Loading model from {args.model} …")
+    model_orig = load_model(args.model, device=device)
+    print(f"  {model_orig.param_count():,} parameters")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        archive.writestr("data.bin", payload)
-        archive.write(model_path, arcname="model.npz")
-        for relative_path in SUBMISSION_FILES:
-            source = repo_root / relative_path
-            archive.write(source, arcname=relative_path)
+    # Round-trip through float16 so that the encoder uses IDENTICALLY quantised
+    # weights as decompress.py will load from the zip.
+    f16_buf = io.BytesIO()
+    save_model_f16(model_orig, f16_buf)
+    f16_buf.seek(0)
+    model = rebuild_from_f16(f16_buf, device=device)
 
-    print(f"records: {record_count}")
-    print(f"top-8 hit rate: {hit_rate:.4f}")
-    print(f"wrote: {output_path}")
+    # Compile for faster inference (PyTorch ≥ 2.0, skipped if unavailable).
+    try:
+        model = torch.compile(model)
+        print("  torch.compile() applied")
+    except Exception:
+        pass
+
+    # Load global frequency table
+    global_probs = np.load(args.global_freq).astype(np.float32)
+    global_probs = np.clip(global_probs, 1e-6, None)
+    global_probs /= global_probs.sum()
+
+    # Load dataset
+    print(f"Loading dataset splits: {args.splits} …")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        sys.exit("pip install datasets")
+
+    ds = load_dataset(
+        "commaai/commavq",
+        num_proc=multiprocessing.cpu_count(),
+        data_files={"train": args.splits},
+        cache_dir=args.data_cache,
+    )["train"]
+    print(f"  {len(ds):,} samples")
+
+    # Load all examples into memory (needed for batch-parallel processing).
+    print("Loading token arrays …")
+    examples = list(ds)   # triggers Arrow cache read, fast on subsequent runs
+
+    compressed_index: Dict[str, bytes] = {}
+    total_raw_bytes = 0
+
+    print("Compressing …")
+    for b_start in range(0, len(examples), ENCODE_BATCH):
+        b_end  = min(b_start + ENCODE_BATCH, len(examples))
+        batch  = examples[b_start:b_end]
+
+        file_names = [ex["json"]["file_name"] for ex in batch]
+        batch_tokens = np.stack(
+            [np.array(ex["token.npy"], dtype=np.int16).reshape(1200, TOKENS_PER_FRAME)
+             for ex in batch]
+        )                                                           # (B, 1200, 128)
+
+        compressed_list = compress_batch(batch_tokens, model, global_probs, device)
+
+        for name, data in zip(file_names, compressed_list):
+            compressed_index[name] = data
+
+        total_raw_bytes += batch_tokens.size * batch_tokens.itemsize
+        print(f"  {b_end}/{len(examples)}", end="\r", flush=True)
+
+    print()
+
+    # Stats before zip overhead
+    total_compressed = sum(len(v) for v in compressed_index.values())
+    raw_tokens_bits  = len(compressed_index) * 1200 * 128 * 10
+    raw_bytes_tokens = raw_tokens_bits // 8
+    print(f"Compressed data:  {raw_bytes_tokens/1e6:.1f} MB raw  →  "
+          f"{total_compressed/1e6:.1f} MB  "
+          f"({raw_bytes_tokens/total_compressed:.2f}× data-only)")
+
+    # Build submission zip
+    print(f"Writing {args.output} …")
+    with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_STORED) as zf:
+        # Python scripts (no compression: text already small)
+        for script_name in ["decompress.py", "model.py", "coder.py"]:
+            zf.write(ROOT / script_name, script_name)
+
+        # Float16 model weights (same bytes that were used for encoding above)
+        f16_buf.seek(0)
+        zf.writestr("model_weights.pt", f16_buf.read())
+
+        # Global frequency table
+        zf.write(args.global_freq, "global_freq.npy")
+
+        # Compressed token bitstreams
+        pkl_buf = io.BytesIO()
+        pickle.dump(compressed_index, pkl_buf)
+        zf.writestr("compressed_data.pkl", pkl_buf.getvalue())
+
+    zip_size = os.path.getsize(args.output)
+    ratio    = raw_bytes_tokens / zip_size
+    print(f"Zip size: {zip_size/1e6:.1f} MB")
+    print(f"Overall compression ratio: {ratio:.2f}×")
+    if ratio >= 3.5:
+        print("✓ Meets the ≥3.5× target!")
+    else:
+        print(f"✗ Below 3.5× — consider training longer or increasing model capacity.")
 
 
 if __name__ == "__main__":

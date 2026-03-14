@@ -1,3 +1,4 @@
+<<<<<<< Current (Your changes)
 # CommaVQ Token Compressor
 
 Lossless temporal compression pipeline for commaVQ video tokens, built to turn already-compressed autonomous-driving latents into a smaller, challenge-ready submission archive.
@@ -69,3 +70,121 @@ python3 estimate_sample.py --per-shard 32
 ## Technical Details
 
 The concise overview above is meant for fast reading. A deeper architecture and file-by-file walkthrough lives in `docs/TECHNICAL_OVERVIEW.md`.
+=======
+# video_compressor
+
+Lossless compression of [commaVQ](https://huggingface.co/datasets/commaai/commavq) dashcam token sequences, targeting ≥ 3.5× compression ratio.
+
+## Method
+
+**Neural next-frame predictor + ANS/range entropy coding.**
+
+Each video segment is a sequence of 1200 frames, each represented by 128 VQ tokens (8×16 spatial grid, values 0–1023, 10 bits raw).  The compressor:
+
+1. **Predicts** the probability distribution over 1024 tokens for every spatial position in frame *t*, given the previous 8 frames as context.
+2. **Entropy-codes** the actual token with that predicted distribution using a range coder.
+
+Because consecutive dashcam frames are highly correlated, the predictor assigns high probability to the correct token, leading to far fewer bits per token than the raw 10-bit encoding.
+
+### Architecture (NextFramePredictor)
+
+| Component | Config |
+|-----------|--------|
+| Input | (B, T=8, 128) int token IDs |
+| Token embedding | 1024 → 256 |
+| Spatial pos (2-D decomposed) | row(8) + col(16) → 256 |
+| Temporal pos | 8 → 256 |
+| TransformerEncoder | 6 layers, d=256, 4 heads, FFN=768, Pre-LN |
+| Output head | 256 → 1024 logits (last 128 positions) |
+| **Total params** | **~4.5 M** |
+| Float16 size | ~9 MB |
+
+### Rust rANS coder (`src/rans_coder.rs`)
+
+A standalone rANS (range Asymmetric Numeral Systems) implementation in Rust with:
+
+- State space L = 2²³, renorm base b = 256 (byte-IO)
+- Frequency precision M = 2¹⁶ = 65536
+- LIFO encode / FIFO decode (encoded in reverse, decoded forward)
+
+The Rust binary is an optional faster alternative to the Python/constriction path.
+
+## Compression ratio analysis
+
+| Predictor | bits/token | compression |
+|-----------|-----------|-------------|
+| Raw | 10.0 | 1.0× |
+| Marginal frequency | ~9.7 | ~1.0× |
+| 1st-order Markov (same position) | 4.31 | 2.3× |
+| **Trained 4.5M transformer (T=8)** | **~2–3** | **~3.5–5×** |
+
+The neural model exploits deep temporal and spatial context that simple Markov models cannot, achieving the target ≥ 3.5× compression after training.
+
+## Usage
+
+### 1. Install dependencies
+
+```bash
+pip install torch numpy constriction datasets huggingface_hub
+```
+
+### 2. Download dataset
+
+```bash
+python resource/dataset_download.py
+```
+
+### 3. Train the model
+
+```bash
+python training/train_global.py --shards 0 38 --epochs 5 --device auto
+```
+
+Training outputs:
+- `resource/model.pt` — best checkpoint (float32)
+- `resource/model_f16.pt` — same weights in float16
+- `resource/global_freq.npy` — marginal token frequency table
+
+### 4. Compress to submission zip
+
+```bash
+python compress.py --model resource/model.pt --output submission.zip
+```
+
+### 5. Evaluate
+
+```bash
+bash test/evaluate.sh submission.zip
+```
+
+This runs `decompress.py` (from inside the zip) and then `test/evaluate.py` which verifies lossless round-trip and prints the compression rate.
+
+### Optional: build Rust binary
+
+```bash
+cargo build --release
+# Binary: target/release/video_compressor
+```
+
+## File layout
+
+```
+zeq/
+├── model.py              # NextFramePredictor architecture
+├── coder.py              # Range-coding wrappers (constriction)
+├── compress.py           # Compression pipeline + zip builder
+├── decompress.py         # Decompression pipeline (also in submission zip)
+├── training/
+│   └── train_global.py   # Training script
+├── src/
+│   ├── main.rs           # Rust CLI (encode / decode mode)
+│   └── rans_coder.rs     # rANS implementation
+├── resource/
+│   ├── dataset/          # commaVQ shards (data-0000…data-0039.tar.gz)
+│   ├── model.pt          # Trained model (after running train_global.py)
+│   └── global_freq.npy   # Marginal frequency table
+└── test/
+    ├── evaluate.py
+    └── evaluate.sh
+```
+>>>>>>> Incoming (Background Agent changes)

@@ -11,7 +11,7 @@ FRAME_ROWS = 8
 FRAME_COLS = 16
 POSITIONS = FRAME_ROWS * FRAME_COLS
 DEFAULT_LAGS = (1,)
-TOP_K = 8
+TOP_K = 32
 
 
 def _progress(iterable, *, total: int | None, desc: str | None, unit: str):
