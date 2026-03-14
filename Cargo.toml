@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[dev-dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+
+[[bin]]
+name = "video_compressor"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,116 +1,144 @@
-use std::env;
+//! video_compressor — Rust CLI entry point.
+//!
+//! This binary provides a fast rANS encode / decode path that can be used as
+//! a drop-in replacement for the Python/constriction range coder.
+//!
+//! # Binary I/O protocol (stdin → stdout)
+//!
+//! ## Encode mode  (`video_compressor encode`)
+//!
+//!   stdin:
+//!     [4 bytes LE]  num_frames  (e.g. 1200)
+//!     [4 bytes LE]  num_tokens  (e.g. 128)
+//!     [4 bytes LE]  vocab_size  (e.g. 1024)
+//!     for each frame:
+//!       [vocab_size × 4 bytes LE f32]  probability table (sums ≈ 1 per token pos)
+//!                                      shape: (num_tokens, vocab_size) row-major
+//!       [num_tokens × 4 bytes LE i32]  symbol IDs
+//!
+//!   stdout:
+//!     [4 bytes LE]  num_frames
+//!     [4 bytes LE]  num_compressed_bytes
+//!     [num_compressed_bytes bytes]  rANS bitstream
+//!
+//! ## Decode mode  (`video_compressor decode`)
+//!
+//!   stdin  = stdout format from encode, followed by the same probability tables
+//!            (in the same frame order) as used during encoding.
+//!   stdout = raw symbol IDs as (num_frames × num_tokens) × 4-byte LE i32 words.
+
+mod rans_coder;
+
 use std::io::{self, Read, Write};
-use std::process;
 
-fn usage() -> ! {
-    eprintln!(
-        "Usage:
-  video_compressor pack10
-  video_compressor unpack10 <count>
-
-Commands read from stdin and write to stdout.
-`pack10` expects little-endian u16 values in [0, 1023].
-`unpack10` emits little-endian u16 values."
-    );
-    process::exit(1);
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off+4].try_into().unwrap())
 }
 
-fn read_all_stdin() -> io::Result<Vec<u8>> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    Ok(input)
+fn read_f32_le(buf: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes(buf[off..off+4].try_into().unwrap())
 }
 
-fn pack10(input: &[u8]) -> io::Result<Vec<u8>> {
-    if input.len() % 2 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input length must be a multiple of 2 bytes",
-        ));
-    }
-
-    let mut output = Vec::with_capacity((input.len() / 2 * 10).div_ceil(8));
-    let mut bit_buffer: u32 = 0;
-    let mut bits_in_buffer = 0usize;
-
-    for chunk in input.chunks_exact(2) {
-        let value = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if value >= 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("token value {value} is outside 10-bit range"),
-            ));
-        }
-
-        bit_buffer |= u32::from(value) << bits_in_buffer;
-        bits_in_buffer += 10;
-
-        while bits_in_buffer >= 8 {
-            output.push((bit_buffer & 0xFF) as u8);
-            bit_buffer >>= 8;
-            bits_in_buffer -= 8;
-        }
-    }
-
-    if bits_in_buffer > 0 {
-        output.push((bit_buffer & 0xFF) as u8);
-    }
-
-    Ok(output)
-}
-
-fn unpack10(input: &[u8], count: usize) -> Vec<u8> {
-    let mut output = Vec::with_capacity(count * 2);
-    let mut input_index = 0usize;
-    let mut bit_buffer: u32 = 0;
-    let mut bits_in_buffer = 0usize;
-
-    for _ in 0..count {
-        while bits_in_buffer < 10 {
-            if input_index >= input.len() {
-                panic!("not enough packed bytes to unpack {count} values");
-            }
-            bit_buffer |= u32::from(input[input_index]) << bits_in_buffer;
-            bits_in_buffer += 8;
-            input_index += 1;
-        }
-
-        let value = (bit_buffer & 0x3FF) as u16;
-        output.extend_from_slice(&value.to_le_bytes());
-        bit_buffer >>= 10;
-        bits_in_buffer -= 10;
-    }
-
-    output
-}
+fn write_u32_le(v: u32) -> [u8; 4] { v.to_le_bytes() }
+fn write_i32_le(v: i32) -> [u8; 4] { v.to_le_bytes() }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        usage();
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("encode");
+
+    let mut stdin_buf = Vec::new();
+    io::stdin().read_to_end(&mut stdin_buf).expect("stdin read");
+
+    let num_frames = read_u32_le(&stdin_buf, 0) as usize;
+    let num_tokens = read_u32_le(&stdin_buf, 4) as usize;
+    let vocab_size = read_u32_le(&stdin_buf, 8) as usize;
+
+    match mode {
+        "encode" => encode_mode(&stdin_buf[12..], num_frames, num_tokens, vocab_size),
+        "decode" => decode_mode(&stdin_buf[12..], num_frames, num_tokens, vocab_size),
+        other    => eprintln!("Unknown mode '{}'; use encode or decode.", other),
+    }
+}
+
+fn encode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: usize) {
+    let probs_per_frame = num_tokens * vocab_size;
+    let bytes_per_prob_block = probs_per_frame * 4;
+    let bytes_per_sym_block  = num_tokens * 4;
+    let _bytes_per_frame = bytes_per_prob_block + bytes_per_sym_block;
+
+    // Collect symbols and CDFs.
+    let mut all_cdfs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_frames);
+    let mut all_syms: Vec<Vec<usize>>    = Vec::with_capacity(num_frames);
+
+    let mut off = 0usize;
+    for _ in 0..num_frames {
+        let mut frame_cdfs = Vec::with_capacity(num_tokens);
+        for j in 0..num_tokens {
+            let probs: Vec<f32> = (0..vocab_size)
+                .map(|v| read_f32_le(data, off + (j * vocab_size + v) * 4))
+                .collect();
+            frame_cdfs.push(rans_coder::probs_to_cdf(&probs));
+        }
+        off += bytes_per_prob_block;
+
+        let syms: Vec<usize> = (0..num_tokens)
+            .map(|j| read_u32_le(data, off + j * 4) as usize)
+            .collect();
+        off += bytes_per_sym_block;
+
+        all_cdfs.push(frame_cdfs);
+        all_syms.push(syms);
     }
 
-    let result = match args[1].as_str() {
-        "pack10" => read_all_stdin().and_then(|input| pack10(&input)),
-        "unpack10" => {
-            if args.len() != 3 {
-                usage();
-            }
-            let count = args[2]
-                .parse::<usize>()
-                .unwrap_or_else(|_| panic!("invalid count: {}", args[2]));
-            read_all_stdin().map(|input| unpack10(&input, count))
+    // Encode backwards (rANS is LIFO).
+    let mut enc = rans_coder::RansEncoder::new();
+    for f in (0..num_frames).rev() {
+        for j in (0..num_tokens).rev() {
+            let s       = all_syms[f][j];
+            let cdf     = &all_cdfs[f][j];
+            let freq    = cdf[s + 1] - cdf[s];
+            let cum_low = cdf[s];
+            enc.encode(freq, cum_low);
         }
-        _ => usage(),
-    };
+    }
+    let compressed = enc.flush();
 
-    match result {
-        Ok(output) => {
-            io::stdout().write_all(&output).unwrap();
+    let mut stdout = io::stdout();
+    stdout.write_all(&write_u32_le(num_frames as u32)).unwrap();
+    stdout.write_all(&write_u32_le(compressed.len() as u32)).unwrap();
+    stdout.write_all(&compressed).unwrap();
+}
+
+fn decode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: usize) {
+    // First: read the compressed bitstream header.
+    let stored_frames = read_u32_le(data, 0) as usize;
+    let comp_len      = read_u32_le(data, 4) as usize;
+    assert_eq!(stored_frames, num_frames);
+
+    let bitstream = &data[8..8 + comp_len];
+    let probs_off  = 8 + comp_len;
+
+    // Read probability tables (same order as during encoding).
+    let mut all_cdfs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_frames);
+    let mut off = probs_off;
+    for _ in 0..num_frames {
+        let mut frame_cdfs = Vec::with_capacity(num_tokens);
+        for j in 0..num_tokens {
+            let probs: Vec<f32> = (0..vocab_size)
+                .map(|v| read_f32_le(data, off + (j * vocab_size + v) * 4))
+                .collect();
+            frame_cdfs.push(rans_coder::probs_to_cdf(&probs));
         }
-        Err(err) => {
-            eprintln!("error: {err}");
-            process::exit(1);
+        off += num_tokens * vocab_size * 4;
+        all_cdfs.push(frame_cdfs);
+    }
+
+    let mut dec = rans_coder::RansDecoder::new(bitstream);
+    let mut stdout = io::stdout();
+    for f in 0..num_frames {
+        for j in 0..num_tokens {
+            let s = dec.decode(&all_cdfs[f][j]);
+            stdout.write_all(&write_i32_le(s as i32)).unwrap();
         }
     }
 }
