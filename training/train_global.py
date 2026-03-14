@@ -13,6 +13,7 @@ Saves:
 import argparse
 import math
 import multiprocessing
+import os
 import random
 import sys
 from pathlib import Path
@@ -91,7 +92,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shards",  type=int, nargs=2, default=[0, 38],
                         metavar=("START", "END"),
-                        help="Half-open range of shards to train on (default: 0 38)")
+                        help="Half-open range of shards to train on (default: 0 38). Use e.g. 0 2 for a quick run with 2 shards.")
     parser.add_argument("--val-shards", type=int, nargs=2, default=[38, 40],
                         metavar=("START", "END"),
                         help="Shards held out for validation (default: 38 40)")
@@ -121,6 +122,15 @@ def main() -> None:
         from datasets import load_dataset
     except ImportError:
         sys.exit("pip install datasets  (HuggingFace datasets library)")
+
+    # Optional: log in to HF to avoid rate-limit warnings (set HF_TOKEN env var)
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        try:
+            from huggingface_hub import login
+            login(token=token)
+        except Exception:
+            pass
 
     train_shards = [f"data-{i:04d}.tar.gz" for i in range(*args.shards)]
     val_shards   = [f"data-{i:04d}.tar.gz" for i in range(*args.val_shards)]

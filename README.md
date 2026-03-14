@@ -140,6 +140,20 @@ python resource/dataset_download.py
 python training/train_global.py --shards 0 38 --epochs 5 --device auto
 ```
 
+Optional: to avoid Hugging Face rate-limit warnings, set a token and re-run (get one at https://huggingface.co/settings/tokens):
+
+```bash
+export HF_TOKEN=your_token_here
+```
+
+**Quick training run (fewer shards, less download):** To avoid downloading all 38 shards, train on 2 shards first (e.g. ~5k samples). Download is much smaller and faster:
+
+```bash
+python training/train_global.py --shards 0 2 --epochs 3 --device auto
+```
+
+**Note on `commaai/commavq-gpt2m`:** That Hugging Face model is a pre-trained **GPT-2 style causal LM** for *generating* driving token sequences. It is not used here. This repo uses the **commaVQ dataset** only and trains a smaller **frame-level** predictor (8 frames → next frame’s 128 tokens in one forward pass), which is faster for compression (1200 passes per video vs token-by-token).
+
 Training outputs:
 - `resource/model.pt` — best checkpoint (float32)
 - `resource/model_f16.pt` — same weights in float16
