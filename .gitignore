@@ -30,3 +30,6 @@ training/temporal_mixture_model.npz
 __pycache__/
 .venv/
 resource/dataset/
+resource/*.pt 
+resource/*.npy 
+.DS_Store
