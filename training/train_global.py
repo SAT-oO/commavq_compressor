@@ -52,54 +52,117 @@ LR                = 3e-4
 WEIGHT_DECAY      = 1e-2
 WARMUP_FRAC       = 0.05  # fraction of total steps used for LR warmup
 GRAD_CLIP         = 1.0
-CHECKPOINT_EVERY  = 2000  # save a resume checkpoint every N steps
 
-MODEL_SAVE      = ROOT / "resource" / "model.pt"
-MODEL_F16_SAVE  = ROOT / "resource" / "model_f16.pt"
+# Three-tier checkpoint strategy
+#   Tier 1 – rolling:  saved every CHECKPOINT_EVERY steps; only 3 kept at once.
+#             Purpose: fine-grained recovery inside an epoch.
+#   Tier 2 – epoch:    saved at the END of every epoch; kept until the run finishes.
+#             Purpose: one clean save per epoch so you can rewind a full epoch.
+#   Tier 3 – best:     saved whenever validation loss improves.
+#             Purpose: always have the best model weights on disk (never deleted).
+CHECKPOINT_EVERY  = 1000  # Tier-1 interval (steps)
+
+MODEL_SAVE       = ROOT / "resource" / "model.pt"
+MODEL_F16_SAVE   = ROOT / "resource" / "model_f16.pt"
 GLOBAL_FREQ_SAVE = ROOT / "resource" / "global_freq.npy"
-CHECKPOINT_DIR  = ROOT / "resource" / "checkpoints"
-DATA_CACHE      = ROOT / "resource" / "dataset"
+CHECKPOINT_DIR   = ROOT / "resource" / "checkpoints"
+DATA_CACHE       = ROOT / "resource" / "dataset"
 
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(
-    model, optimizer, epoch, global_step, best_val_loss,
-    total_steps, warmup_steps, args_ns,
-):
-    """Write a resumable checkpoint (model + optimizer + training state)."""
+def _build_payload(model, optimizer, epoch, global_step,
+                   best_val_loss, total_steps, warmup_steps, args_ns):
+    return {
+        "model":         model.state_dict(),
+        "optimizer":     optimizer.state_dict(),
+        "epoch":         epoch,
+        "global_step":   global_step,
+        "best_val_loss": best_val_loss,
+        "total_steps":   total_steps,
+        "warmup_steps":  warmup_steps,
+        "args":          vars(args_ns),
+    }
+
+
+def save_rolling_checkpoint(model, optimizer, epoch, global_step,
+                             best_val_loss, total_steps, warmup_steps, args_ns):
+    """
+    Tier 1 – rolling checkpoint saved every N steps.
+    Keeps the 3 most recent; older ones are deleted automatically.
+    File pattern:  checkpoints/step_NNNNNNN.pt
+    """
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     path = CHECKPOINT_DIR / f"step_{global_step:07d}.pt"
     torch.save(
-        {
-            "model":          model.state_dict(),
-            "optimizer":      optimizer.state_dict(),
-            "epoch":          epoch,
-            "global_step":    global_step,
-            "best_val_loss":  best_val_loss,
-            "total_steps":    total_steps,
-            "warmup_steps":   warmup_steps,
-            "args":           vars(args_ns),
-        },
+        _build_payload(model, optimizer, epoch, global_step,
+                       best_val_loss, total_steps, warmup_steps, args_ns),
         path,
     )
-    # Keep only the 3 most recent checkpoints to save disk space.
-    ckpts = sorted(CHECKPOINT_DIR.glob("step_*.pt"))
-    for old in ckpts[:-3]:
-        old.unlink()
-    print(f"  ✓ checkpoint → {path.name}")
+    # Purge old rolling checkpoints; epoch/best files have different prefixes.
+    rolling = sorted(CHECKPOINT_DIR.glob("step_*.pt"))
+    for old in rolling[:-3]:
+        old.unlink(missing_ok=True)
+    print(f"  [ckpt-rolling] {path.name}")
+    return path
+
+
+def save_epoch_checkpoint(model, optimizer, epoch, global_step,
+                           best_val_loss, total_steps, warmup_steps, args_ns):
+    """
+    Tier 2 – end-of-epoch checkpoint.
+    Never auto-deleted.  File pattern:  checkpoints/epoch_EE_step_NNNNNNN.pt
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = CHECKPOINT_DIR / f"epoch_{epoch:03d}_step_{global_step:07d}.pt"
+    torch.save(
+        _build_payload(model, optimizer, epoch, global_step,
+                       best_val_loss, total_steps, warmup_steps, args_ns),
+        path,
+    )
+    print(f"  [ckpt-epoch]   {path.name}")
+    return path
+
+
+def save_best_checkpoint(model, optimizer, epoch, global_step,
+                          best_val_loss, total_steps, warmup_steps, args_ns):
+    """
+    Tier 3 – best-so-far checkpoint (overwritten each time val loss improves).
+    File:  checkpoints/best.pt
+    Also writes model.pt / model_f16.pt for use by compress.py.
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = CHECKPOINT_DIR / "best.pt"
+    torch.save(
+        _build_payload(model, optimizer, epoch, global_step,
+                       best_val_loss, total_steps, warmup_steps, args_ns),
+        path,
+    )
+    # Export weights for the compression pipeline
+    torch.save(model.state_dict(), MODEL_SAVE)
+    save_model_f16(model, MODEL_F16_SAVE)
+    print(f"  [ckpt-best]    {path.name}  →  also wrote model.pt + model_f16.pt")
     return path
 
 
 def load_checkpoint(path, model, optimizer, device):
-    """Load a checkpoint and return the saved training state dict."""
+    """Load any checkpoint tier and return its state dict."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     print(f"Resumed from {path}  (epoch {ckpt['epoch']}, step {ckpt['global_step']})")
     return ckpt
+
+
+def latest_checkpoint():
+    """Return the most recent rolling or epoch checkpoint path, or None."""
+    candidates = sorted(
+        list(CHECKPOINT_DIR.glob("step_*.pt")) +
+        list(CHECKPOINT_DIR.glob("epoch_*.pt"))
+    )
+    return candidates[-1] if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +226,15 @@ def main() -> None:
     parser.add_argument("--device",  default="auto")
     parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY,
                         metavar="N",
-                        help=f"Save a resume checkpoint every N steps (default: {CHECKPOINT_EVERY})")
+                        help=f"Save a rolling checkpoint every N steps (default: {CHECKPOINT_EVERY}). "
+                             "3 rolling + all epoch + best checkpoints are kept.")
     parser.add_argument("--resume-from", default=None, metavar="CHECKPOINT_PATH",
-                        help="Resume training from a checkpoint file, e.g. "
-                             "resource/checkpoints/step_0005000.pt")
+                        help="Resume from a specific checkpoint file, e.g. "
+                             "resource/checkpoints/step_0005000.pt  or  "
+                             "resource/checkpoints/best.pt")
+    parser.add_argument("--auto-resume", action="store_true",
+                        help="Automatically resume from the most recent checkpoint "
+                             "found in resource/checkpoints/ (no need to specify path).")
     args = parser.parse_args()
 
     # Device
@@ -280,18 +348,25 @@ def main() -> None:
     # ---------------------------------------------------------------------------
     # Optional: resume from checkpoint
     # ---------------------------------------------------------------------------
-    start_epoch    = 1
-    global_step    = 0
-    best_val_loss  = float("inf")
+    start_epoch   = 1
+    global_step   = 0
+    best_val_loss = float("inf")
 
-    if args.resume_from:
-        ckpt = load_checkpoint(args.resume_from, model, optimizer, device)
-        start_epoch   = ckpt["epoch"]       # resume at the epoch that was in progress
+    resume_path = args.resume_from
+    if args.auto_resume and not resume_path:
+        resume_path = latest_checkpoint()
+        if resume_path:
+            print(f"--auto-resume: found {resume_path.name}")
+        else:
+            print("--auto-resume: no checkpoint found, starting fresh")
+
+    if resume_path:
+        ckpt = load_checkpoint(resume_path, model, optimizer, device)
+        start_epoch   = ckpt["epoch"]
         global_step   = ckpt["global_step"]
         best_val_loss = ckpt["best_val_loss"]
-        # Respect the original LR schedule lengths if they differ.
-        total_steps  = ckpt.get("total_steps",  total_steps)
-        warmup_steps = ckpt.get("warmup_steps", warmup_steps)
+        total_steps   = ckpt.get("total_steps",  total_steps)
+        warmup_steps  = ckpt.get("warmup_steps", warmup_steps)
         print(f"  Resuming: epoch {start_epoch}, step {global_step}, "
               f"best_val_loss {best_val_loss:.4f}")
 
@@ -330,9 +405,9 @@ def main() -> None:
                 print(f"  epoch {epoch}/{args.epochs}  step {global_step}  "
                       f"train_loss={avg:.4f}  ({2**avg:.2f} bits/token)  lr={lr:.2e}")
 
-            # Periodic checkpoint
+            # Tier 1 – rolling checkpoint every N steps
             if global_step % args.checkpoint_every == 0:
-                save_checkpoint(
+                save_rolling_checkpoint(
                     model, optimizer, epoch, global_step, best_val_loss,
                     total_steps, warmup_steps, args,
                 )
@@ -359,14 +434,16 @@ def main() -> None:
               f"val={val_loss:.4f}  ({bits_per_token:.2f} bits/token → "
               f"~{est_ratio:.2f}× compression)")
 
+        # Tier 3 – best checkpoint (overwrites previous best each time)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), MODEL_SAVE)
-            save_model_f16(model, MODEL_F16_SAVE)
-            print(f"  ✓ best model → {MODEL_SAVE}")
+            save_best_checkpoint(
+                model, optimizer, epoch, global_step, best_val_loss,
+                total_steps, warmup_steps, args,
+            )
 
-        # End-of-epoch checkpoint (always save so you can resume between epochs)
-        save_checkpoint(
+        # Tier 2 – epoch checkpoint (one per epoch, never deleted)
+        save_epoch_checkpoint(
             model, optimizer, epoch + 1, global_step, best_val_loss,
             total_steps, warmup_steps, args,
         )
