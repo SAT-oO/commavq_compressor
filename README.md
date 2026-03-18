@@ -2,6 +2,8 @@
 
 Lossless compression of [commaVQ](https://huggingface.co/datasets/commaai/commavq) dashcam token sequences, targeting ≥ 3.5× compression ratio.
 
+Also available on [HuggingFace] (https://huggingface.co/SAT-oO/commavq_compression/tree/main)
+
 ## What this repo currently uses
 
 Active pipeline (kept and maintained):
