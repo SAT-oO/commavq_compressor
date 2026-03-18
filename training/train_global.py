@@ -266,8 +266,9 @@ def main() -> None:
                         help="Per-GPU batch size. 512 saturates an H100 with this model. "
                              "Reduce if OOM.")
     parser.add_argument("--lr",      type=float, default=LR)
-    parser.add_argument("--workers", type=int,   default=n_cpu,
-                        help=f"DataLoader worker processes. Defaults to all logical CPUs ({n_cpu}).")
+    parser.add_argument("--workers", "--num-workers", dest="workers", type=int, default=n_cpu,
+                        help=f"DataLoader worker processes (alias: --num-workers). "
+                             f"Defaults to all logical CPUs ({n_cpu}).")
     parser.add_argument("--prefetch-factor", type=int, default=4,
                         help="Batches prefetched per DataLoader worker (default: 4).")
     parser.add_argument("--device",  default="auto",
@@ -301,7 +302,6 @@ def main() -> None:
     use_bf16, _ = configure_hardware(device, args.workers)
     if args.no_bf16:
         use_bf16 = False
-    amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
     print(f"{'='*60}\n")
 
     # ── HuggingFace login (optional) ─────────────────────────────────────────

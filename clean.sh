@@ -1,6 +1,6 @@
 #!/bin/bash
-# clean.sh — wipe all training artifacts so you can start fresh on the cloud.
-# Safe to run multiple times. Does NOT touch source code or dataset tar.gz files.
+# clean.sh — wipe generated artifacts while keeping source code.
+# Safe to run multiple times.
 set -e
 cd "$(dirname "$0")"
 
@@ -23,23 +23,22 @@ echo "  removed resource/checkpoints/"
 rm -f compression_challenge_submission.zip submission.zip
 echo "  removed submission zip(s)"
 
-# 5. HuggingFace Arrow cache (decoded dataset cache — regenerated automatically
-#    from the .tar.gz shards on next run, so safe to delete)
-rm -rf resource/dataset/commaai___commavq/
-rm -rf resource/dataset/.cache/
-rm -f  resource/dataset/*.lock
-echo "  removed HuggingFace Arrow + lock cache"
+# 5. Dataset/cache artifacts (HF cache and any manually downloaded shards)
+rm -rf resource/dataset/
+echo "  removed resource/dataset/ cache + shard copies"
+
+# 6. Python and Rust build caches
+rm -rf __pycache__/ test/__pycache__/ training/__pycache__/ target/
+echo "  removed build/cache folders"
 
 echo ""
 echo "=== Clean complete. Files kept ==="
-echo "  resource/dataset/data-*.tar.gz   (raw shards — do NOT delete, re-download is slow)"
-echo "  resource/tokens.npy              (sample reference, not used by training)"
-echo "  resource/dataset_download.py"
-echo "  All source code (*.py, *.rs)"
+echo "  All source code (*.py, *.rs, docs)"
+echo "  Legacy code under legacy/"
 echo ""
 echo "=== Ready for cloud training. Next steps ==="
 echo "  1. Copy this repo to cloud:  rsync -av --exclude='.venv' . user@cloud:/workspace/commavq/"
 echo "  2. On cloud:                 pip install -r requirements.txt"
-echo "  3. Train:                    python training/train_global.py --shards 0 38 --val-shards 38 40 --epochs 10 --batch 128 --device auto"
+echo "  3. Train:                    python training/train_global.py --shards 0 38 --val-shards 38 40 --epochs 10 --batch 512 --device auto --workers 16"
 echo "  4. Compress:                 python compress.py --model resource/model.pt --output submission.zip"
 echo "  5. Evaluate:                 bash test/evaluate.sh submission.zip"

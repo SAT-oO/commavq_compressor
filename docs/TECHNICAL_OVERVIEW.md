@@ -1,110 +1,143 @@
 # Technical Overview
 
-## Goal
+## Scope
 
-This repository implements a lossless compressor for commaVQ token sequences that remains compatible with the official `commaai/commavq/compression` evaluation flow.
+This document describes the **active** lossless compression pipeline in this repository.
+Legacy code from older approaches was moved to `legacy/` and is intentionally out of the critical path.
 
-The project is organized around four responsibilities:
+Goal: compress commaVQ token sequences while preserving exact reconstruction, then package the output in the format expected by `test/evaluate.sh`.
 
-- learn a hierarchical temporal predictor over token frames
-- convert copy modes and novel-token probability distributions into a compressed bitstream
-- reconstruct the original tokens exactly during decompression
-- package the result into the archive shape expected by the challenge evaluator
+---
 
-## Architecture
+## Active Architecture
 
-### `codec/`
+### 1) Predictor: `model.py`
 
-`codec/` contains the reusable codec mechanics.
+`NextFramePredictor` is a transformer encoder that predicts next-frame token probabilities.
 
-- `codec/bits.py`
-  Packs and unpacks token arrays into dense 10-bit form. It optionally uses the Rust helper binary for faster pack/unpack.
+- input: `B x 8 x 128` token IDs (`8` prior frames, `128` positions/frame)
+- output: `B x 128 x 1024` logits (`1024` token classes per position)
+- parameter count: ~4.48M
+- positional scheme:
+  - temporal embedding for frame index in the context window
+  - decomposed spatial embedding (`row + col`) for the 8x16 grid
 
-- `codec/dataset.py`
-  Reads local `.tar.gz` evaluation shards directly and yields `(file_name, tokens)` records. It also provides fast record counting and per-shard sampling helpers for small experiments.
+Why this model helps compression:
 
-- `codec/format.py`
-  Defines the archive format stored inside `data.bin`. Warmup frames are stored in packed 10-bit form. For later frames, the codec first entropy-codes a small copy-mode stream and then entropy-codes only the novel tokens that are not explained by lagged copies.
+- range coding cost for a symbol is `-log2(p(symbol))` bits
+- better probability calibration from temporal context lowers average bits/token
+- lower bits/token yields higher compression ratio, while still being lossless
 
-### `model/`
+### 2) Entropy coder: `coder.py`
 
-- `model/temporal.py`
-  Defines `TemporalMixtureModel`, a deterministic hierarchical predictor. It combines:
-  - copy-mode priors for several temporal lags
-  - global token priors
-  - per-row and per-position token priors
-  - cluster-conditioned token priors
-  - lagged transition distributions
-  - row-conditioned lagged transition distributions
+`coder.py` wraps `constriction` range coding with a simple API:
 
-  At inference time it predicts:
-  - a copy mode for each of the `128` positions
-  - a novel-token distribution for positions that are not copied from prior lags
+- `FrameEncoder.encode_frame(tokens, probs)`
+- `FrameDecoder.decode_frame(probs)`
 
-### `runtime/`
+Both encoder and decoder use the same model family (`Categorical`) and the same quantized model weights, ensuring deterministic decode.
 
-- `runtime/entropy.py`
-  Provides the portable entropy-coding runtime. It uses `constriction` for categorical range coding and includes portable frame-by-frame encoder/decoder helpers used by both compression and decompression.
+### 3) Training: `training/train_global.py`
 
-### Top-level entrypoints
+Responsibilities:
+
+- load selected commaVQ shards via Hugging Face `datasets`
+- sample random `(context, target)` pairs from each video clip
+- train with AdamW + cosine schedule
+- write:
+  - `resource/model.pt`
+  - `resource/model_f16.pt`
+  - `resource/global_freq.npy`
+  - multi-tier checkpoints under `resource/checkpoints/`
+
+Performance features:
+
+- CUDA auto-selection, BF16 mixed precision (optional)
+- `torch.compile` (optional)
+- configurable worker/prefetch settings for dataloaders
+- CPU threading setup for high-core machines
+
+Checkpoint tiers:
+
+- rolling `step_*.pt` (latest 3)
+- epoch `epoch_*.pt` (kept)
+- best `best.pt` + exported model weights
+
+Resume options:
+
+- `--resume-from <path>`
+- `--auto-resume`
+
+### 4) Compression packaging: `compress.py`
+
+Workflow:
+
+1. load trained model and global prior
+2. quantize model to float16 bytes and reload for deterministic parity with decompressor
+3. stream dataset samples, predict per-frame probabilities in chunks
+4. entropy-code each frame
+5. write submission zip containing:
+   - `decompress.py`
+   - `model.py`
+   - `coder.py`
+   - `model_weights.pt`
+   - `global_freq.npy`
+   - `compressed_data.pkl`
+
+Memory behavior:
+
+- current implementation avoids materializing full-probability tensors for all frames at once
+- per-sample chunked prediction reduces peak RAM usage during compression
+
+### 5) Decompression: `decompress.py`
+
+Workflow at evaluation time:
+
+1. load bundled float16 model weights
+2. load global prior and compressed bitstreams
+3. decode frames sequentially using the same predicted distributions used for encoding
+4. write `.npy` token files into `OUTPUT_DIR`
+
+Lossless guarantee:
+
+- arithmetic/range decoding is exact if model outputs and symbol streams match
+- this is why compression path uses the same quantized weight representation shipped in the zip
+
+### 6) Evaluation: `test/evaluate.sh`, `test/evaluate.py`
+
+- unzips submission
+- runs bundled `decompress.py`
+- validates reconstructed tokens against ground truth
+- prints compression ratio
+
+---
+
+## Data Flow Summary
+
+1. **Train:** raw commaVQ shards -> trained predictor (`model.pt`)
+2. **Compress:** predictor + tokens -> entropy-coded streams + model bundle (`submission.zip`)
+3. **Decompress:** bundled model + streams -> exact token reconstruction
+4. **Evaluate:** compare reconstruction + compute ratio
+
+---
+
+## Repository Map (active files)
 
 - `training/train_global.py`
-  Trains and exports the temporal model as `training/temporal_mixture_model.npz`.
-
+- `model.py`
+- `coder.py`
 - `compress.py`
-  Builds a challenge-compatible submission zip by encoding the target shards and bundling the decompression runtime.
-
 - `decompress.py`
-  The script that the official evaluator executes after unzipping the submission. It reconstructs the extensionless NumPy token files into `OUTPUT_DIR`.
+- `test/evaluate.py`
+- `test/evaluate.sh`
+- `src/` (optional Rust rANS implementation; not required by Python pipeline)
 
-- `estimate_sample.py`
-  Runs a balanced small-sample experiment on the first two evaluation shards and reports an estimated full-dataset compression rate.
+Legacy modules are in `legacy/`.
 
-- `test/build_submission.py`
-  Local convenience wrapper that trains the model if needed and then invokes `compress.py`.
+---
 
-## Compression Flow
+## Operational Notes
 
-1. Read token arrays from the evaluation shards.
-2. Store the first `warmup_frames` raw in packed 10-bit form.
-3. For each later frame:
-   - predict a copy mode for each position
-   - entropy-code the copy modes
-   - for positions marked as novel, generate token distributions from prior context
-   - entropy-code only those novel tokens
-4. Store all segments inside a single `data.bin` archive plus a compact exported model.
-5. Bundle `decompress.py` and its required runtime files into the submission zip.
-
-## Decompression Flow
-
-1. Load `model.npz`.
-2. Read `data.bin`.
-3. Restore warmup frames from packed 10-bit storage.
-4. Reconstruct later frames sequentially by:
-   - recomputing copy-mode probabilities from already-decoded context
-   - decoding copy modes
-   - copying tokens from prior lags when the mode indicates a copy
-   - decoding only the remaining novel tokens with the same categorical model family
-5. Write exact token arrays to the output location expected by the official evaluator.
-
-## Current Design Trade-offs
-
-- The model is deterministic and lightweight, which keeps the decompression runtime portable.
-- The entropy coder is real probability-driven coding, not a generic backend compressor like `lzma`.
-- The explicit copy-mode split is designed to capture cheap temporal redundancy before novel-token coding.
-- The predictor is still simpler than a transformer-based model, so this repo is structured to make future model upgrades straightforward.
-
-## Recommended Workflow
-
-Full challenge build:
-
-```bash
-python3 test/build_submission.py --train-if-missing
-bash test/evaluate.sh compression_challenge_submission.zip
-```
-
-Quick experimental estimate:
-
-```bash
-python3 estimate_sample.py --per-shard 32
-```
+- Training/compression pull data from Hugging Face directly; manual shard download is optional.
+- For large runs, keep checkpoints and use `--auto-resume`.
+- If `compress.py` is killed on CPU, reduce memory pressure with `--frame-chunk` and/or run on CUDA.
