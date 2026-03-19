@@ -47,6 +47,19 @@ python training/train_global.py \
   --workers 16
 ```
 
+Run used for the current best reported result (**2.93x overall compression**):
+
+```bash
+python training/train_global.py \
+  --shards 0 38 \
+  --val-shards 38 40 \
+  --epochs 16 \
+  --batch 256 \
+  --device auto \
+  --workers 16 \
+  --prefetch-factor 4
+```
+
 Checkpoints are saved during training:
 
 - rolling: `resource/checkpoints/step_*.pt` (latest 3)
@@ -56,7 +69,7 @@ Checkpoints are saved during training:
 Resume after interruption:
 
 ```bash
-python training/train_global.py --auto-resume --shards 0 38 --epochs 10 --batch 512
+python training/train_global.py --auto-resume --shards 0 38 --epochs 16 --batch 256
 ```
 
 ### 3) Build submission zip
@@ -86,8 +99,8 @@ Submission:
 
 ## Expected compression
 
-With full-data training (shards `0..37`) and good convergence, expected ratio is typically around **3.3× to 4.0×**.  
-Untrained or partially trained models usually stay near **1.0×–2.0×**.
+Current measured run (command above): **2.9× overall compression**.  
+With full-data training and stronger convergence, runs may improve beyond this baseline.
 
 ## Notes
 
