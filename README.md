@@ -35,16 +35,30 @@ export HF_TOKEN=your_token_here
 
 ### 2) Train
 
-Full dataset on a strong GPU:
+Full dataset on a strong GPU (ambitious H100 run for best quality):
 
 ```bash
 python training/train_global.py \
   --shards 0 38 \
   --val-shards 38 40 \
-  --epochs 10 \
-  --batch 512 \
+  --epochs 40 \
+  --batch 192 \
   --device auto \
-  --workers 16
+  --workers 16 \
+  --prefetch-factor 4
+```
+
+Run used for the current best reported result (**2.93x overall compression**):
+
+```bash
+python training/train_global.py \
+  --shards 0 38 \
+  --val-shards 38 40 \
+  --epochs 16 \
+  --batch 256 \
+  --device auto \
+  --workers 16 \
+  --prefetch-factor 4
 ```
 
 Run used for the current best reported result (**2.93x overall compression**):
@@ -70,6 +84,10 @@ Resume after interruption:
 
 ```bash
 python training/train_global.py --auto-resume --shards 0 38 --epochs 16 --batch 256
+<<<<<<< HEAD
+=======
+python training/train_global.py --auto-resume --shards 0 38 --epochs 40 --batch 192 --workers 16 --prefetch-factor 4
+>>>>>>> 11e30ed (doc: update readme for new result)
 ```
 
 ### 3) Build submission zip
@@ -99,7 +117,7 @@ Submission:
 
 ## Expected compression
 
-Current measured run (command above): **2.9× overall compression**.  
+Current measured run (command above): **2.93× overall compression**.  
 With full-data training and stronger convergence, runs may improve beyond this baseline.
 
 ## Notes
