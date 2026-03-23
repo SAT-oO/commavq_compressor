@@ -90,9 +90,7 @@ class NextFramePredictor(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-# ---------------------------------------------------------------------------
 # Context-building helpers (shared by compress / decompress / training)
-# ---------------------------------------------------------------------------
 
 def build_context(tokens: np.ndarray, t: int, T: int = CONTEXT_FRAMES) -> np.ndarray:
     """
@@ -137,9 +135,7 @@ def build_context_batch(
     return pad
 
 
-# ---------------------------------------------------------------------------
 # Model I/O
-# ---------------------------------------------------------------------------
 
 def load_model(path: str, device: str = "cpu") -> NextFramePredictor:
     """Load a saved model (supports float32 and float16 state dicts).

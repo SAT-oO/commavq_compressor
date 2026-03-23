@@ -32,15 +32,19 @@ mod rans_coder;
 use std::io::{self, Read, Write};
 
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off+4].try_into().unwrap())
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
 fn read_f32_le(buf: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes(buf[off..off+4].try_into().unwrap())
+    f32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
-fn write_u32_le(v: u32) -> [u8; 4] { v.to_le_bytes() }
-fn write_i32_le(v: i32) -> [u8; 4] { v.to_le_bytes() }
+fn write_u32_le(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+fn write_i32_le(v: i32) -> [u8; 4] {
+    v.to_le_bytes()
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -56,19 +60,19 @@ fn main() {
     match mode {
         "encode" => encode_mode(&stdin_buf[12..], num_frames, num_tokens, vocab_size),
         "decode" => decode_mode(&stdin_buf[12..], num_frames, num_tokens, vocab_size),
-        other    => eprintln!("Unknown mode '{}'; use encode or decode.", other),
+        other => eprintln!("Unknown mode '{}'; use encode or decode.", other),
     }
 }
 
 fn encode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: usize) {
     let probs_per_frame = num_tokens * vocab_size;
     let bytes_per_prob_block = probs_per_frame * 4;
-    let bytes_per_sym_block  = num_tokens * 4;
+    let bytes_per_sym_block = num_tokens * 4;
     let _bytes_per_frame = bytes_per_prob_block + bytes_per_sym_block;
 
     // Collect symbols and CDFs.
     let mut all_cdfs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_frames);
-    let mut all_syms: Vec<Vec<usize>>    = Vec::with_capacity(num_frames);
+    let mut all_syms: Vec<Vec<usize>> = Vec::with_capacity(num_frames);
 
     let mut off = 0usize;
     for _ in 0..num_frames {
@@ -94,9 +98,9 @@ fn encode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: us
     let mut enc = rans_coder::RansEncoder::new();
     for f in (0..num_frames).rev() {
         for j in (0..num_tokens).rev() {
-            let s       = all_syms[f][j];
-            let cdf     = &all_cdfs[f][j];
-            let freq    = cdf[s + 1] - cdf[s];
+            let s = all_syms[f][j];
+            let cdf = &all_cdfs[f][j];
+            let freq = cdf[s + 1] - cdf[s];
             let cum_low = cdf[s];
             enc.encode(freq, cum_low);
         }
@@ -105,18 +109,20 @@ fn encode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: us
 
     let mut stdout = io::stdout();
     stdout.write_all(&write_u32_le(num_frames as u32)).unwrap();
-    stdout.write_all(&write_u32_le(compressed.len() as u32)).unwrap();
+    stdout
+        .write_all(&write_u32_le(compressed.len() as u32))
+        .unwrap();
     stdout.write_all(&compressed).unwrap();
 }
 
 fn decode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: usize) {
     // First: read the compressed bitstream header.
     let stored_frames = read_u32_le(data, 0) as usize;
-    let comp_len      = read_u32_le(data, 4) as usize;
+    let comp_len = read_u32_le(data, 4) as usize;
     assert_eq!(stored_frames, num_frames);
 
     let bitstream = &data[8..8 + comp_len];
-    let probs_off  = 8 + comp_len;
+    let probs_off = 8 + comp_len;
 
     // Read probability tables (same order as during encoding).
     let mut all_cdfs: Vec<Vec<Vec<u32>>> = Vec::with_capacity(num_frames);

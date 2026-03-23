@@ -23,9 +23,7 @@ pub const L: u32 = 1 << LOG2_L;
 pub const FREQ_BITS: u32 = 16;
 pub const M: u32 = 1 << FREQ_BITS; // total frequency = 65536
 
-// ---------------------------------------------------------------------------
 // Encoder
-// ---------------------------------------------------------------------------
 
 pub struct RansEncoder {
     state: u32,
@@ -34,7 +32,10 @@ pub struct RansEncoder {
 
 impl RansEncoder {
     pub fn new() -> Self {
-        Self { state: L, output: Vec::new() }
+        Self {
+            state: L,
+            output: Vec::new(),
+        }
     }
 
     /// Encode one symbol.
@@ -63,17 +64,15 @@ impl RansEncoder {
         // Emit state MSB-first (will be at the *end* of the reversed output).
         self.output.push(((x >> 24) & 0xFF) as u8);
         self.output.push(((x >> 16) & 0xFF) as u8);
-        self.output.push(((x >>  8) & 0xFF) as u8);
-        self.output.push(( x        & 0xFF) as u8);
+        self.output.push(((x >> 8) & 0xFF) as u8);
+        self.output.push((x & 0xFF) as u8);
         // Reverse: encoder output must be read forward by decoder.
         self.output.reverse();
         self.output
     }
 }
 
-// ---------------------------------------------------------------------------
 // Decoder
-// ---------------------------------------------------------------------------
 
 pub struct RansDecoder<'a> {
     state: u32,
@@ -85,11 +84,15 @@ impl<'a> RansDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         // Read initial state (4 bytes, little-endian — matches the encoder's
         // flush which reverses the output byte stream).
-        let state =  (data[0] as u32)
-                  | ((data[1] as u32) <<  8)
-                  | ((data[2] as u32) << 16)
-                  | ((data[3] as u32) << 24);
-        Self { state, data, pos: 4 }
+        let state = (data[0] as u32)
+            | ((data[1] as u32) << 8)
+            | ((data[2] as u32) << 16)
+            | ((data[3] as u32) << 24);
+        Self {
+            state,
+            data,
+            pos: 4,
+        }
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -122,7 +125,7 @@ impl<'a> RansDecoder<'a> {
                 hi = mid - 1;
             }
         }
-        let s    = lo;
+        let s = lo;
         let freq = cdf[s + 1] - cdf[s];
 
         // Update state.
@@ -137,9 +140,7 @@ impl<'a> RansDecoder<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Frequency table helpers
-// ---------------------------------------------------------------------------
 
 /// Convert a slice of probability weights (non-negative floats) to integer
 /// cumulative frequencies that sum exactly to M=65536.
@@ -170,11 +171,13 @@ pub fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_unstable_by(|&a, &b| freqs[b].cmp(&freqs[a]));
         for idx in order {
-            if excess == 0 { break; }
+            if excess == 0 {
+                break;
+            }
             let available = freqs[idx] - 1;
-            let removed   = available.min(excess);
-            freqs[idx]   -= removed;
-            excess        -= removed;
+            let removed = available.min(excess);
+            freqs[idx] -= removed;
+            excess -= removed;
         }
     }
 
@@ -187,9 +190,7 @@ pub fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
     cdf
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -199,17 +200,19 @@ mod tests {
     fn uniform_cdf(n: usize) -> Vec<u32> {
         let f = M / n as u32;
         let mut cdf = vec![0u32; n + 1];
-        for i in 0..n { cdf[i + 1] = cdf[i] + f; }
+        for i in 0..n {
+            cdf[i + 1] = cdf[i] + f;
+        }
         cdf[n] = M;
         cdf
     }
 
     #[test]
     fn round_trip_uniform() {
-        let mut rng   = SmallRng::seed_from_u64(42);
-        let cdf       = uniform_cdf(256);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let cdf = uniform_cdf(256);
         let symbols: Vec<usize> = (0..1000).map(|_| rng.gen_range(0..256)).collect();
-        let freqs: Vec<u32>     = (0..256).map(|i| cdf[i+1] - cdf[i]).collect();
+        let freqs: Vec<u32> = (0..256).map(|i| cdf[i + 1] - cdf[i]).collect();
 
         let mut enc = RansEncoder::new();
         for &s in symbols.iter().rev() {
@@ -227,7 +230,7 @@ mod tests {
     #[test]
     fn probs_to_cdf_sums_to_m() {
         let probs: Vec<f32> = (0..1024).map(|i| (i + 1) as f32).collect();
-        let s: f32          = probs.iter().sum();
+        let s: f32 = probs.iter().sum();
         let probs_norm: Vec<f32> = probs.iter().map(|&p| p / s).collect();
         let cdf = probs_to_cdf(&probs_norm);
         assert_eq!(*cdf.last().unwrap(), M);

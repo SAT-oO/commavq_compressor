@@ -61,9 +61,7 @@ from training.model import (
     save_model_f16,
 )
 
-# ---------------------------------------------------------------------------
 # Hyper-parameters
-# ---------------------------------------------------------------------------
 PAIRS_PER_SAMPLE = 12    # random (context, target) pairs sampled per clip per epoch
 LR               = 3e-4
 WEIGHT_DECAY     = 1e-2
@@ -80,9 +78,7 @@ CHECKPOINT_DIR   = ROOT / "resource" / "checkpoints"
 DATA_CACHE       = ROOT / "resource" / "dataset"
 
 
-# ---------------------------------------------------------------------------
 # Hardware setup
-# ---------------------------------------------------------------------------
 
 def configure_hardware(device: str, n_workers: int) -> tuple[bool, int]:
     """
@@ -126,9 +122,7 @@ def configure_hardware(device: str, n_workers: int) -> tuple[bool, int]:
     return use_bf16, n_cpu
 
 
-# ---------------------------------------------------------------------------
 # Checkpoint helpers
-# ---------------------------------------------------------------------------
 
 def _state(model):
     """Return state dict, unwrapping torch.compile wrapper if present."""
@@ -213,9 +207,7 @@ def latest_checkpoint():
     return candidates[-1] if candidates else None
 
 
-# ---------------------------------------------------------------------------
 # Dataset
-# ---------------------------------------------------------------------------
 
 class TokenDataset(Dataset):
     def __init__(self, tokens_list: list, pairs_per_sample: int = PAIRS_PER_SAMPLE):
@@ -233,9 +225,7 @@ class TokenDataset(Dataset):
         return torch.from_numpy(ctx), torch.from_numpy(target)
 
 
-# ---------------------------------------------------------------------------
 # LR schedule: linear warmup → cosine decay
-# ---------------------------------------------------------------------------
 
 def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
     if step < warmup:
@@ -244,9 +234,7 @@ def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     n_cpu = os.cpu_count() or 1

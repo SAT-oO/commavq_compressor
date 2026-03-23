@@ -34,7 +34,7 @@ Submission output:
 
 ## Notes
 
-- Training and evaluation download data from Hugging Face directly (`commaai/commavq`).
+- Training and evaluation download data from Hugging Face directly.
 - Manual local shard copies are optional.
 - `compress.py` can be memory-heavy on CPU; prefer CUDA for packaging.
 - Implementation details: `docs/TECHNICAL_OVERVIEW.md`.

@@ -46,9 +46,7 @@ ENCODE_BATCH   = 128    # samples grouped per outer batch
 FRAME_CHUNK    = 64     # time-step chunks within one sample's inference
 
 
-# ---------------------------------------------------------------------------
 # Core compression routine
-# ---------------------------------------------------------------------------
 
 def _predict_all_frames(
     tokens: np.ndarray,             # (1200, 128) int16 for one sample
@@ -106,9 +104,7 @@ def compress_batch(
     return results
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser()
