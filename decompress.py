@@ -22,8 +22,8 @@ OUTPUT_DIR  = Path(os.environ.get("OUTPUT_DIR", SCRIPT_DIR))
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from coder import FrameDecoder
-from model import (
+from training.coder import FrameDecoder
+from training.model import (
     CONTEXT_FRAMES,
     TOKENS_PER_FRAME,
     NextFramePredictor,

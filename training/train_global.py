@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from model import (
+from training.model import (
     TOKENS_PER_FRAME,
     NextFramePredictor,
     build_context,

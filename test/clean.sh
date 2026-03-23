@@ -2,7 +2,7 @@
 # clean.sh — wipe generated artifacts while keeping source code.
 # Safe to run multiple times.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 echo "=== Cleaning training artifacts ==="
 

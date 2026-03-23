@@ -1,17 +1,16 @@
-# Technical Overview
+# Commavq Compression Challenge 
 
-## Scope
+## Overview 
 
-This document describes the **active** lossless compression pipeline in this repository.
-Legacy code from older approaches was moved to `legacy/` and is intentionally out of the critical path.
+Goal is to compress CommaVQ token sequences fetched from [HuggingFace](https://huggingface.co/datasets/commaai/commavq) loselessly as part of CommaAI Compression Challenge. 
 
-Goal: compress commaVQ token sequences while preserving exact reconstruction, then package the output in the format expected by `test/evaluate.sh`.
+Overall performance comes out to be **~3.05x compression rate**. 
 
 ---
 
-## Active Architecture
+## Architecture
 
-### 1) Predictor: `model.py`
+### 1. Predictor: `training/model.py`
 
 `NextFramePredictor` is a transformer encoder that predicts next-frame token probabilities.
 
@@ -28,16 +27,16 @@ Why this model helps compression:
 - better probability calibration from temporal context lowers average bits/token
 - lower bits/token yields higher compression ratio, while still being lossless
 
-### 2) Entropy coder: `coder.py`
+### 2. Entropy coder: `training/coder.py`
 
-`coder.py` wraps `constriction` range coding with a simple API:
+`training/coder.py` wraps `constriction` range coding with a simple API:
 
 - `FrameEncoder.encode_frame(tokens, probs)`
 - `FrameDecoder.decode_frame(probs)`
 
 Both encoder and decoder use the same model family (`Categorical`) and the same quantized model weights, ensuring deterministic decode.
 
-### 3) Training: `training/train_global.py`
+### 3. Training: `training/train_global.py`
 
 Responsibilities:
 
@@ -68,7 +67,7 @@ Resume options:
 - `--resume-from <path>`
 - `--auto-resume`
 
-### 4) Compression packaging: `compress.py`
+### 4. Compression packaging: `compress.py`
 
 Workflow:
 
@@ -78,8 +77,8 @@ Workflow:
 4. entropy-code each frame
 5. write submission zip containing:
    - `decompress.py`
-   - `model.py`
-   - `coder.py`
+   - `training/model.py`
+   - `training/coder.py`
    - `model_weights.pt`
    - `global_freq.npy`
    - `compressed_data.pkl`
@@ -89,7 +88,7 @@ Memory behavior:
 - current implementation avoids materializing full-probability tensors for all frames at once
 - per-sample chunked prediction reduces peak RAM usage during compression
 
-### 5) Decompression: `decompress.py`
+### 5. Decompression: `decompress.py`
 
 Workflow at evaluation time:
 
@@ -103,7 +102,7 @@ Lossless guarantee:
 - arithmetic/range decoding is exact if model outputs and symbol streams match
 - this is why compression path uses the same quantized weight representation shipped in the zip
 
-### 6) Evaluation: `test/evaluate.sh`, `test/evaluate.py`
+### 6. Evaluation: `test/evaluate.sh`, `test/evaluate.py`
 
 - unzips submission
 - runs bundled `decompress.py`
@@ -124,8 +123,8 @@ Lossless guarantee:
 ## Repository Map (active files)
 
 - `training/train_global.py`
-- `model.py`
-- `coder.py`
+- `training/model.py`
+- `training/coder.py`
 - `compress.py`
 - `decompress.py`
 - `test/evaluate.py`
@@ -141,3 +140,15 @@ Legacy modules are in `legacy/`.
 - Training/compression pull data from Hugging Face directly; manual shard download is optional.
 - For large runs, keep checkpoints and use `--auto-resume`.
 - If `compress.py` is killed on CPU, reduce memory pressure with `--frame-chunk` and/or run on CUDA.
+
+---
+
+## Cleanup Tip
+
+At the end of experiments, two maintenance scripts in `test/` can help:
+
+- `test/clean.sh`  
+  Local repository cleanup: removes generated training artifacts, checkpoints, zip outputs, and caches.
+
+- `test/clean.py`  
+  Hugging Face model-repo cleanup helper: removes accidentally uploaded root-level checkpoint files.

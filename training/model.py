@@ -188,7 +188,6 @@ def rebuild_from_f16(buf_or_path, device: str = "cpu") -> NextFramePredictor:
     Returns a NEW model with weights that are identical to what decompress.py
     will load from the submission zip.
     """
-    import io
     from pathlib import Path as _Path
     if isinstance(buf_or_path, (str, _Path)):
         return load_model(buf_or_path, device=device)
