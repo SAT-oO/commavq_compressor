@@ -11,8 +11,8 @@ Available on HuggingFace: [SAT-oO/commavq_compression](https://huggingface.co/SA
 The maintained end-to-end path is:
 
 - `training/train_global.py` — train next-frame predictor + checkpoints
-- `training/model.py` — 4.48M parameter transformer (`8` frame context)
-- `training/coder.py` — range coding wrappers (`constriction`)
+- `model.py` — 4.48M parameter transformer (`8` frame context)
+- `coder.py` — range coding wrappers (`constriction`)
 - `compress.py` — build submission zip
 - `decompress.py` — reconstruct tokens in evaluator
 - `test/evaluate.sh` + `test/evaluate.py` — correctness + ratio check

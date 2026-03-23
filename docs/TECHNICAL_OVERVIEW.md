@@ -10,7 +10,7 @@ Overall performance comes out to be **~3.05x compression rate**.
 
 ## Architecture
 
-### 1. Predictor: `training/model.py`
+### 1. Predictor: `model.py`
 
 `NextFramePredictor` is a transformer encoder that predicts next-frame token probabilities.
 
@@ -27,9 +27,9 @@ Why this model helps compression:
 - better probability calibration from temporal context lowers average bits/token
 - lower bits/token yields higher compression ratio, while still being lossless
 
-### 2. Entropy coder: `training/coder.py`
+### 2. Entropy coder: `coder.py`
 
-`training/coder.py` wraps `constriction` range coding with a simple API:
+`coder.py` wraps `constriction` range coding with a simple API:
 
 - `FrameEncoder.encode_frame(tokens, probs)`
 - `FrameDecoder.decode_frame(probs)`
@@ -77,8 +77,8 @@ Workflow:
 4. entropy-code each frame
 5. write submission zip containing:
    - `decompress.py`
-   - `training/model.py`
-   - `training/coder.py`
+   - `model.py`
+   - `coder.py`
    - `model_weights.pt`
    - `global_freq.npy`
    - `compressed_data.pkl`
@@ -123,8 +123,8 @@ Lossless guarantee:
 ## Repository Map (active files)
 
 - `training/train_global.py`
-- `training/model.py`
-- `training/coder.py`
+- `model.py`
+- `coder.py`
 - `compress.py`
 - `decompress.py`
 - `test/evaluate.py`

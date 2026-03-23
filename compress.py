@@ -7,9 +7,9 @@ Usage:
                        [--splits data-0000.tar.gz data-0001.tar.gz]
 
 The output zip contains:
-    decompress.py            – decompression entry-point
-    training/model.py        – model architecture
-    training/coder.py        – range-coding wrappers
+    decompress.py          – decompression entry-point
+    model.py               – model architecture
+    coder.py               – range-coding wrappers
     model_weights.pt       – float16 model weights
     global_freq.npy        – marginal token frequency table
     compressed_data.pkl    – compressed bitstreams keyed by file_name
@@ -31,8 +31,8 @@ import torch
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from training.coder import FrameEncoder
-from training.model import (
+from coder import FrameEncoder
+from model import (
     CONTEXT_FRAMES,
     TOKENS_PER_FRAME,
     NextFramePredictor,
@@ -209,9 +209,8 @@ def main() -> None:
     with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_STORED) as zf:
         # Python scripts (no compression: text already small)
         zf.write(ROOT / "decompress.py", "decompress.py")
-        zf.write(ROOT / "training" / "__init__.py", "training/__init__.py")
-        zf.write(ROOT / "training" / "model.py", "training/model.py")
-        zf.write(ROOT / "training" / "coder.py", "training/coder.py")
+        zf.write(ROOT / "model.py", "model.py")
+        zf.write(ROOT / "coder.py", "coder.py")
 
         # Float16 model weights (same bytes that were used for encoding above)
         f16_buf.seek(0)
