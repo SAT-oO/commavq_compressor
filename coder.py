@@ -23,17 +23,19 @@ _MIN_PROB = 1e-6
 
 def _safe_probs(probs: np.ndarray) -> np.ndarray:
     """Clip and renormalise so every entry is positive and rows sum to 1."""
-    p = np.clip(probs, _MIN_PROB, None).astype(np.float32)
+    # Round first to reduce tiny floating-point drift across encode/decode
+    # environments before constriction quantises probabilities internally.
+    p = np.round(probs, decimals=7)
+    p = np.clip(p, _MIN_PROB, None).astype(np.float32)
     p /= p.sum(axis=-1, keepdims=True)
     return p
 
 
 class FrameEncoder:
-    """Accumulates encoded frames into a single byte-stream."""
+    """Accumulates independently encoded frame payloads."""
 
     def __init__(self) -> None:
-        self._enc = constriction.stream.queue.RangeEncoder()
-        self._frames = 0
+        self._frame_payloads = []
 
     def encode_frame(self, tokens: np.ndarray, probs: np.ndarray) -> None:
         """
@@ -41,24 +43,33 @@ class FrameEncoder:
         probs  : (S, VOCAB_SIZE) float32 probability table
         """
         p = _safe_probs(probs)
-        self._enc.encode(tokens.astype(np.int32), _CAT, p)
-        self._frames += 1
+        enc = constriction.stream.queue.RangeEncoder()
+        enc.encode(tokens.astype(np.int32), _CAT, p)
+        arr = np.asarray(enc.get_compressed(), dtype="<u4")
+        self._frame_payloads.append(arr.tobytes())
 
     def to_bytes(self) -> bytes:
-        """Serialise compressed stream to bytes (little-endian uint32 words)."""
-        arr = np.asarray(self._enc.get_compressed(), dtype="<u4")
-        # Prepend a 4-byte frame count so the decoder knows how many to expect.
-        header = struct.pack("<I", self._frames)
-        return header + arr.tobytes()
+        """Serialise framed payloads: [n_frames][len][payload]..."""
+        parts = [struct.pack("<I", len(self._frame_payloads))]
+        for payload in self._frame_payloads:
+            parts.append(struct.pack("<I", len(payload)))
+            parts.append(payload)
+        return b"".join(parts)
 
 
 class FrameDecoder:
-    """Decodes frames from a byte-stream produced by FrameEncoder."""
+    """Decodes framed payloads produced by FrameEncoder."""
 
     def __init__(self, data: bytes) -> None:
         (self._n_frames,) = struct.unpack_from("<I", data, 0)
-        arr = np.frombuffer(data[4:], dtype="<u4").astype(np.uint32)
-        self._dec = constriction.stream.queue.RangeDecoder(arr)
+        self._payloads = []
+        offset = 4
+        for _ in range(self._n_frames):
+            (n_bytes,) = struct.unpack_from("<I", data, offset)
+            offset += 4
+            payload = data[offset: offset + n_bytes]
+            offset += n_bytes
+            self._payloads.append(payload)
         self._decoded = 0
 
     @property
@@ -70,7 +81,12 @@ class FrameDecoder:
         probs  : (S, VOCAB_SIZE) float32 probability table
         Returns: (S,) int32 token IDs
         """
+        if self._decoded >= self._n_frames:
+            raise RuntimeError("Attempted to decode beyond available frames.")
+
         p = _safe_probs(probs)
-        tokens = self._dec.decode(_CAT, p)
+        arr = np.frombuffer(self._payloads[self._decoded], dtype="<u4").astype(np.uint32)
+        dec = constriction.stream.queue.RangeDecoder(arr)
+        tokens = dec.decode(_CAT, p)
         self._decoded += 1
         return tokens

@@ -43,38 +43,48 @@ from model import (
 )
 
 ENCODE_BATCH   = 128    # samples grouped per outer batch
-FRAME_CHUNK    = 64     # time-step chunks within one sample's inference
+
+
+# Force deterministic behavior for lossless ANS parity.
+def configure_determinism() -> None:
+    torch.use_deterministic_algorithms(True)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 # Core compression routine
 
-def _predict_all_frames(
-    tokens: np.ndarray,             # (1200, 128) int16 for one sample
+def _encode_one_sample(
+    tokens: np.ndarray,             # (num_frames, 128) int16 for one sample
     model: NextFramePredictor,
     device: str,
     global_tile: np.ndarray,        # (128, 1024) float32
-) -> np.ndarray:
+) -> bytes:
     """
-    Run model once per sample, batching all 1200 time steps at once.
-    Returns (1200, 128, 1024) float32 probability arrays.
+    Encode one sample sequentially (frame-by-frame).
+
+    This mirrors decompression's autoregressive schedule to minimize numerical
+    drift between encoder and decoder probability generation.
     """
-    T_len = len(tokens)
-    batch = tokens[None]    # (1, T_len, 128)
+    num_frames = len(tokens)
+    enc = FrameEncoder()
+    tokens_batch = tokens[None]  # (1, num_frames, 128)
 
-    # Build all context windows: (T_len, T, 128)
-    all_ctx = np.stack([build_context_batch(batch, t)[0] for t in range(T_len)])
+    for t in range(num_frames):
+        if t == 0:
+            probs = global_tile
+        else:
+            ctx = build_context_batch(tokens_batch, t)         # (1, T, 128)
+            x = torch.tensor(ctx.astype(np.int64), device=device)
+            with torch.no_grad():
+                logits = model(x)                              # (1, 128, 1024)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+        enc.encode_frame(tokens[t], probs)
 
-    all_probs = []
-    with torch.no_grad():
-        for start in range(0, T_len, FRAME_CHUNK):
-            end = min(start + FRAME_CHUNK, T_len)
-            x = torch.tensor(all_ctx[start:end].astype(np.int64), device=device)
-            logits = model(x)                               # (chunk, 128, 1024)
-            all_probs.append(torch.softmax(logits, dim=-1).cpu().numpy())
-
-    probs_all = np.concatenate(all_probs, axis=0)          # (T_len, 128, 1024)
-    probs_all[0] = global_tile                              # override frame 0
-    return probs_all
+    return enc.to_bytes()
 
 
 def compress_batch(
@@ -84,10 +94,9 @@ def compress_batch(
     device: str,
 ) -> List[bytes]:
     """
-    Compress B token sequences.  For each sample we run the model across
-    all 1200 time steps in one batched inference call, then entropy-code.
+    Compress B token sequences, one sample at a time.
     """
-    B, num_frames, _ = batch_tokens.shape
+    B, _, _ = batch_tokens.shape
 
     global_tile = np.broadcast_to(
         global_probs[None, :], (TOKENS_PER_FRAME, len(global_probs))
@@ -95,11 +104,7 @@ def compress_batch(
 
     results = []
     for i in range(B):
-        probs = _predict_all_frames(batch_tokens[i], model, device, global_tile)
-        enc = FrameEncoder()
-        for t in range(num_frames):
-            enc.encode_frame(batch_tokens[i, t], probs[t])
-        results.append(enc.to_bytes())
+        results.append(_encode_one_sample(batch_tokens[i], model, device, global_tile))
 
     return results
 
@@ -115,7 +120,14 @@ def main() -> None:
     parser.add_argument("--splits", nargs="+",
                         default=["data-0000.tar.gz", "data-0001.tar.gz"])
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (off by default for deterministic packaging).",
+    )
     args = parser.parse_args()
+
+    configure_determinism()
 
     # Device selection
     if args.device == "auto":
@@ -141,12 +153,13 @@ def main() -> None:
     f16_buf.seek(0)
     model = rebuild_from_f16(f16_buf, device=device)
 
-    # Compile for faster inference (PyTorch ≥ 2.0, skipped if unavailable).
-    try:
-        model = torch.compile(model)
-        print("  torch.compile() applied")
-    except Exception:
-        pass
+    # Compile only when explicitly requested.
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            print("  torch.compile() applied")
+        except Exception:
+            pass
 
     # Load global frequency table
     global_probs = np.load(args.global_freq).astype(np.float32)

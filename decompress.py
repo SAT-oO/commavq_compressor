@@ -30,14 +30,21 @@ from model import (
     build_context_batch,
 )
 
-DECODE_BATCH = 256   # samples decoded in parallel per model forward pass
+def configure_determinism() -> None:
+    torch.use_deterministic_algorithms(True)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def select_device() -> str:
+    forced = os.environ.get("DECOMPRESS_DEVICE")
+    if forced:
+        return forced
     if torch.cuda.is_available():
         return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -59,12 +66,7 @@ def decompress_all(
     output_dir: Path,
 ) -> None:
     """
-    Decompress all samples, batching model inference across samples at each
-    time step to amortise GPU kernel launch overhead.
-
-    Because decoding is sequential within each sample (frame t's decoded
-    tokens are the context for frame t+1), we must maintain per-sample
-    decoder state across time steps.
+    Decompress all samples sample-by-sample, frame-by-frame.
     """
     file_names  = list(compressed_index.keys())
     comp_bytes  = [compressed_index[n] for n in file_names]
@@ -74,66 +76,44 @@ def decompress_all(
         global_probs[None, :], (TOKENS_PER_FRAME, len(global_probs))
     ).astype(np.float32)
 
-    # Create one FrameDecoder per sample; read frame count from each header.
-    decoders = [FrameDecoder(b) for b in comp_bytes]
-    num_frames = decoders[0].n_frames          # all samples must have same length
+    print(f"Decoding {N} samples on {device} …")
 
-    # Allocate decoded token buffer (all samples in memory at once).
-    all_tokens = np.zeros((N, num_frames, TOKENS_PER_FRAME), dtype=np.int16)
-
-    print(f"Decoding {N} samples × {num_frames} frames on {device} …")
-
-    for t in range(num_frames):
-        # ── Model inference (batched over all N samples) ───────────────────
-        if t == 0:
-            # First frame: use global marginal prior.
-            probs_all = np.stack([global_tile] * N)    # (N, S, V)
-        else:
-            probs_parts = []
-            for b_start in range(0, N, DECODE_BATCH):
-                b_end = min(b_start + DECODE_BATCH, N)
-                ctx   = build_context_batch(all_tokens, t)  # (N, T, S)
-                ctx_b = ctx[b_start:b_end]
-                x     = torch.tensor(ctx_b.astype(np.int64), device=device)
-                with torch.no_grad():
-                    logits = model(x)                        # (B, S, V)
-                    probs_parts.append(
-                        torch.softmax(logits, dim=-1).cpu().numpy()
-                    )
-            probs_all = np.concatenate(probs_parts, axis=0)  # (N, S, V)
-
-        # ── Per-sample decode (sequential but cheap) ───────────────────────
-        for i in range(N):
-            decoded = decoders[i].decode_frame(probs_all[i])     # (S,) int32
-            all_tokens[i, t] = decoded.astype(np.int16)
-
-        if (t + 1) % 100 == 0:
-            print(f"  frame {t+1}/{num_frames}", end="\r", flush=True)
-
-    print()
-
-    # Save decompressed arrays.
     for i, name in enumerate(file_names):
+        dec = FrameDecoder(comp_bytes[i])
+        num_frames = dec.n_frames
+        tokens = np.zeros((num_frames, TOKENS_PER_FRAME), dtype=np.int16)
+
+        for t in range(num_frames):
+            if t == 0:
+                probs = global_tile
+            else:
+                ctx = build_context_batch(tokens[None], t)      # (1, T, S)
+                x = torch.tensor(ctx.astype(np.int64), device=device)
+                with torch.no_grad():
+                    logits = model(x)                           # (1, S, V)
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            decoded = dec.decode_frame(probs)
+            tokens[t] = decoded.astype(np.int16)
+
         out_path = output_dir / name
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Reshape back to original (num_frames, 8, 16) dataset format.
-        np.save(out_path, all_tokens[i].reshape(num_frames, 8, 16))
+        np.save(out_path, tokens.reshape(num_frames, 8, 16))
+        print(f"  {i+1}/{N}", end="\r", flush=True)
+
+    print()
 
     print(f"Saved {N} arrays to {output_dir}")
 
 
 def main() -> None:
+    configure_determinism()
+
     device = select_device()
     print(f"Device: {device}")
 
     model = load_model_weights(SCRIPT_DIR / "model_weights.pt", device)
     print(f"Model loaded ({model.param_count():,} parameters)")
-    try:
-        model = torch.compile(model)
-        print("  torch.compile() applied")
-    except Exception:
-        pass
-
     global_probs = np.load(SCRIPT_DIR / "global_freq.npy").astype(np.float32)
     global_probs = np.clip(global_probs, 1e-6, None)
     global_probs /= global_probs.sum()

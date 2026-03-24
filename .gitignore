@@ -24,9 +24,9 @@ target
 # Added by cargo
 
 /target
-compression_challenge_submission.zip
-compression_challenge_submission_decompressed/
-training/temporal_mixture_model.npz
+*.zip
+test/*/
+training/*/
 __pycache__/
 venv/
 resource/dataset/ 
