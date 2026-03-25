@@ -44,6 +44,27 @@ CODEC_BACKEND=rust RUST_CODEC_BIN=target/release/video_compressor python compres
 CODEC_BACKEND=rust RUST_CODEC_BIN=target/release/video_compressor python decompress.py
 ```
 
+Compress with Rust backend:
+
+```bash 
+CODEC_BACKEND=rust RUST_CODEC_BIN=target/release/video_compressor \
+python3 compress.py \
+  --model resource/model.pt \
+  --global-freq resource/global_freq.npy \
+  --output compression_challenge_submission.zip \
+  --device cuda \
+  --encode-batch 512 \
+  --coder-threads 24
+```
+
+Evaluate with matching backend:
+
+```bash 
+CODEC_BACKEND=rust RUST_CODEC_BIN=target/release/video_compressor \
+DECOMPRESS_DEVICE=cuda \
+bash test/evaluate.sh compression_challenge_submission.zip
+```
+
 Run with default backend (recommended for reference parity):
 
 ```bash
