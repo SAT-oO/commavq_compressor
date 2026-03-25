@@ -65,8 +65,10 @@ def decompress_all(
     device: str,
     output_dir: Path,
     decode_batch: int = 1,
+    decode_batch: int = 1,
 ) -> None:
     """
+    Decompress samples in batches to match encoder inference shape when needed.
     Decompress samples in batches to match encoder inference shape when needed.
     """
     file_names  = list(compressed_index.keys())
@@ -90,16 +92,39 @@ def decompress_all(
         decoders = [FrameDecoder(b) for b in bytes_b]
         num_frames = decoders[0].n_frames
         tokens_b = np.zeros((B, num_frames, TOKENS_PER_FRAME), dtype=np.int16)
+    decode_batch = max(1, int(decode_batch))
+    print(f"Decoding {N} samples on {device} (decode_batch={decode_batch}) …")
+
+    done = 0
+    for b_start in range(0, N, decode_batch):
+        b_end = min(b_start + decode_batch, N)
+        names_b = file_names[b_start:b_end]
+        bytes_b = comp_bytes[b_start:b_end]
+        B = len(names_b)
+
+        decoders = [FrameDecoder(b) for b in bytes_b]
+        num_frames = decoders[0].n_frames
+        tokens_b = np.zeros((B, num_frames, TOKENS_PER_FRAME), dtype=np.int16)
 
         for t in range(num_frames):
             if t == 0:
                 probs_all = np.broadcast_to(
                     global_tile[None, :, :], (B, TOKENS_PER_FRAME, len(global_probs))
                 )
+                probs_all = np.broadcast_to(
+                    global_tile[None, :, :], (B, TOKENS_PER_FRAME, len(global_probs))
+                )
             else:
+                ctx = build_context_batch(tokens_b, t)      # (B, T, S)
                 ctx = build_context_batch(tokens_b, t)      # (B, T, S)
                 x = torch.tensor(ctx.astype(np.int64), device=device)
                 with torch.no_grad():
+                    logits = model(x)                       # (B, S, V)
+                    probs_all = torch.softmax(logits, dim=-1).cpu().numpy()
+
+            for i in range(B):
+                decoded = decoders[i].decode_frame(probs_all[i])
+                tokens_b[i, t] = decoded.astype(np.int16)
                     logits = model(x)                       # (B, S, V)
                     probs_all = torch.softmax(logits, dim=-1).cpu().numpy()
 
@@ -110,7 +135,9 @@ def decompress_all(
         for i, name in enumerate(names_b):
             out_path = output_dir / name
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(out_path, tokens_b[i].reshape(num_frames, 8, 16))
+            # Save to the exact evaluator path key (no auto ".npy" suffix).
+            with open(out_path, "wb") as f:
+                np.save(f, tokens_b[i].reshape(num_frames, 8, 16))
             done += 1
             print(f"  {done}/{N}", end="\r", flush=True)
 
@@ -140,9 +167,26 @@ def main() -> None:
     else:
         compressed_index = packed
         encode_batch_hint = 1
+        packed = pickle.load(f)
+    # Backward compatible with both old and new packaging layouts.
+    if isinstance(packed, dict) and "__data__" in packed:
+        compressed_index = packed["__data__"]
+        encode_batch_hint = int(packed.get("__meta__", {}).get("encode_batch", 1))
+    else:
+        compressed_index = packed
+        encode_batch_hint = 1
     print(f"Compressed index: {len(compressed_index)} entries")
     decode_batch = int(os.environ.get("DECODE_BATCH", encode_batch_hint))
+    decode_batch = int(os.environ.get("DECODE_BATCH", encode_batch_hint))
 
+    decompress_all(
+        compressed_index,
+        model,
+        global_probs,
+        device,
+        OUTPUT_DIR,
+        decode_batch=decode_batch,
+    )
     decompress_all(
         compressed_index,
         model,
