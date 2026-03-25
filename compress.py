@@ -16,6 +16,7 @@ The output zip contains:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import io
 import multiprocessing
 import os
@@ -42,7 +43,7 @@ from model import (
     save_model_f16,
 )
 
-ENCODE_BATCH   = 128    # samples grouped per outer batch
+DEFAULT_ENCODE_BATCH = 128
 
 
 # Force deterministic behavior for lossless ANS parity.
@@ -57,34 +58,15 @@ def configure_determinism() -> None:
 
 # Core compression routine
 
-def _encode_one_sample(
-    tokens: np.ndarray,             # (num_frames, 128) int16 for one sample
-    model: NextFramePredictor,
-    device: str,
-    global_tile: np.ndarray,        # (128, 1024) float32
-) -> bytes:
-    """
-    Encode one sample sequentially (frame-by-frame).
-
-    This mirrors decompression's autoregressive schedule to minimize numerical
-    drift between encoder and decoder probability generation.
-    """
-    num_frames = len(tokens)
-    enc = FrameEncoder()
-    tokens_batch = tokens[None]  # (1, num_frames, 128)
-
-    for t in range(num_frames):
-        if t == 0:
-            probs = global_tile
-        else:
-            ctx = build_context_batch(tokens_batch, t)         # (1, T, 128)
-            x = torch.tensor(ctx.astype(np.int64), device=device)
-            with torch.no_grad():
-                logits = model(x)                              # (1, 128, 1024)
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
-        enc.encode_frame(tokens[t], probs)
-
-    return enc.to_bytes()
+def _encode_slice(
+    encoders: List[FrameEncoder],
+    batch_tokens_t: np.ndarray,
+    probs_all: np.ndarray,
+    start: int,
+    end: int,
+) -> None:
+    for i in range(start, end):
+        encoders[i].encode_frame(batch_tokens_t[i], probs_all[i])
 
 
 def compress_batch(
@@ -92,21 +74,56 @@ def compress_batch(
     model: NextFramePredictor,
     global_probs: np.ndarray,       # (1024,) float32
     device: str,
+    coder_threads: int = 1,
 ) -> List[bytes]:
     """
-    Compress B token sequences, one sample at a time.
+    Compress B token sequences.
+
+    Predictor work is batched across samples per time step (good for GPU
+    utilization), while entropy coding runs on CPU.
     """
-    B, _, _ = batch_tokens.shape
+    B, num_frames, _ = batch_tokens.shape
 
     global_tile = np.broadcast_to(
         global_probs[None, :], (TOKENS_PER_FRAME, len(global_probs))
     ).astype(np.float32)
 
-    results = []
-    for i in range(B):
-        results.append(_encode_one_sample(batch_tokens[i], model, device, global_tile))
+    encoders = [FrameEncoder() for _ in range(B)]
+    max_workers = max(1, min(int(coder_threads), B))
+    executor = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
 
-    return results
+    try:
+        for t in range(num_frames):
+            if t == 0:
+                probs_all = np.broadcast_to(
+                    global_tile[None, :, :], (B, TOKENS_PER_FRAME, len(global_probs))
+                )
+            else:
+                ctx = build_context_batch(batch_tokens, t)         # (B, T, 128)
+                x = torch.tensor(ctx.astype(np.int64), device=device)
+                with torch.no_grad():
+                    logits = model(x)                              # (B, 128, 1024)
+                    probs_all = torch.softmax(logits, dim=-1).cpu().numpy()
+
+            if executor is None:
+                for i in range(B):
+                    encoders[i].encode_frame(batch_tokens[i, t], probs_all[i])
+            else:
+                batch_t = batch_tokens[:, t, :]
+                chunk = (B + max_workers - 1) // max_workers
+                futures = []
+                for start in range(0, B, chunk):
+                    end = min(start + chunk, B)
+                    futures.append(
+                        executor.submit(_encode_slice, encoders, batch_t, probs_all, start, end)
+                    )
+                for fut in futures:
+                    fut.result()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    return [enc.to_bytes() for enc in encoders]
 
 
 # Main
@@ -120,6 +137,18 @@ def main() -> None:
     parser.add_argument("--splits", nargs="+",
                         default=["data-0000.tar.gz", "data-0001.tar.gz"])
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--encode-batch",
+        type=int,
+        default=DEFAULT_ENCODE_BATCH,
+        help="Number of samples encoded per outer batch.",
+    )
+    parser.add_argument(
+        "--coder-threads",
+        type=int,
+        default=1,
+        help="CPU threads for entropy coding in each outer batch.",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
@@ -189,8 +218,8 @@ def main() -> None:
     total_raw_bytes = 0
 
     print("Compressing …")
-    for b_start in range(0, len(examples), ENCODE_BATCH):
-        b_end  = min(b_start + ENCODE_BATCH, len(examples))
+    for b_start in range(0, len(examples), args.encode_batch):
+        b_end  = min(b_start + args.encode_batch, len(examples))
         batch  = examples[b_start:b_end]
 
         file_names = [ex["json"]["file_name"] for ex in batch]
@@ -199,7 +228,13 @@ def main() -> None:
              for ex in batch]
         )                                                           # (B, 1200, 128)
 
-        compressed_list = compress_batch(batch_tokens, model, global_probs, device)
+        compressed_list = compress_batch(
+            batch_tokens,
+            model,
+            global_probs,
+            device,
+            coder_threads=args.coder_threads,
+        )
 
         for name, data in zip(file_names, compressed_list):
             compressed_index[name] = data
