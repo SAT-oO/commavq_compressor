@@ -141,9 +141,9 @@ fn decode_mode(data: &[u8], num_frames: usize, num_tokens: usize, vocab_size: us
 
     let mut dec = rans_coder::RansDecoder::new(bitstream);
     let mut stdout = io::stdout();
-    for f in 0..num_frames {
-        for j in 0..num_tokens {
-            let s = dec.decode(&all_cdfs[f][j]);
+    for frame_cdfs in all_cdfs.iter() {
+        for cdf in frame_cdfs.iter() {
+            let s = dec.decode(cdf);
             stdout.write_all(&write_i32_le(s as i32)).unwrap();
         }
     }

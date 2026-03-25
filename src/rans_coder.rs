@@ -118,7 +118,7 @@ impl<'a> RansDecoder<'a> {
         let mut lo = 0usize;
         let mut hi = cdf.len() - 2; // last valid symbol index
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = (lo + hi).div_ceil(2);
             if cdf[mid] <= slot {
                 lo = mid;
             } else {
