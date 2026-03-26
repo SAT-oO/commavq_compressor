@@ -2,7 +2,7 @@
 
 Lossless compression of [commaVQ](https://huggingface.co/datasets/commaai/commavq) HuggingFace dashcam token sequences for comma.ai challenge evaluation.
 
-Overall performance of **3.05x overall compression** with training parameters specified in `docs`. 
+Overall performance of **2.96x overall compression** with training parameters specified in `docs`. 
 
 Available on HuggingFace: [SAT-oO/commavq_compression](https://huggingface.co/SAT-oO/commavq_compression/tree/main)
 
