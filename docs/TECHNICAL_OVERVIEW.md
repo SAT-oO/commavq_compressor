@@ -9,7 +9,7 @@ evaluation subset of [commaai/commavq](https://huggingface.co/datasets/commaai/c
 Observed with current final settings:
 
 - Data-only rate: ~`3.05x`
-- Overall submission rate: ~`2.96x` (displayed as `3.0` by evaluator)
+- Overall submission rate: ~`2.96x` (displayed as `3.0x` by evaluator)
 
 ## Model (`model.py`)
 

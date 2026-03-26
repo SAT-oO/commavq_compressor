@@ -5,7 +5,7 @@ Lossless compression pipeline for [commaai/commavq](https://huggingface.co/datas
 Current validated result on the official evaluation path (`data-0000` + `data-0001`):
 
 - Data-only rate (`compressed_data.pkl`): ~`3.05x`
-- Overall submission rate (`submission.zip`): ~`2.96x` (prints as `3.0`)
+- Overall submission rate (`submission.zip`): ~`2.96x` (prints as `3.0x`)
 
 ## Active pipeline
 
