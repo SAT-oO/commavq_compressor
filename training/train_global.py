@@ -2,22 +2,23 @@
 """
 Train NextFramePredictor on the commavq token dataset.
 
-Usage (full H100 run):
+Final training profile used in docs:
     python training/train_global.py \\
         --shards 0 38 --val-shards 38 40 \\
-        --epochs 10 --batch 512 --device auto
+        --epochs 40 --batch 192 --device auto \\
+        --workers 16 --prefetch-factor 4
 
 Resume after a crash:
     python training/train_global.py --auto-resume \\
-        --shards 0 38 --epochs 10 --batch 512
+        --shards 0 38 --epochs 40 --batch 192
 
 Saves:
     resource/model.pt                       best model weights (float32)
     resource/model_f16.pt                   best model weights (float16, for submission)
-    resource/global_freq.npy               marginal token frequency table
-    resource/checkpoints/step_NNNNNNN.pt   rolling resume checkpoint (3 kept)
-    resource/checkpoints/epoch_EEE_*.pt    end-of-epoch checkpoint (all kept)
-    resource/checkpoints/best.pt           best-val-loss checkpoint (always kept)
+    resource/global_freq.npy                marginal token frequency table
+    resource/checkpoints/step_NNNNNNN.pt    rolling resume checkpoint (3 kept)
+    resource/checkpoints/epoch_EEE_*.pt     end-of-epoch checkpoint (all kept)
+    resource/checkpoints/best.pt            best-val-loss checkpoint (always kept)
 """
 
 # ── Pin CPU thread counts before any library imports that spawn threads ──────

@@ -14,30 +14,17 @@ Optional (avoid Hugging Face unauthenticated warnings):
 export HF_TOKEN=your_token_here
 ```
 
-If running remote env: 
+If running remote env:
 
-```bash 
-python -m venv --system-site-packages venv 
+```bash
+python -m venv --system-site-packages venv
 source venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
 ### 2. Train
 
-Baseline full-data run (~2.93x compression rate)
-
-```bash
-python training/train_global.py \
-  --shards 0 38 \
-  --val-shards 38 40 \
-  --epochs 16 \
-  --batch 256 \
-  --device auto \
-  --workers 16 \
-  --prefetch-factor 4
-```
-
-More ambitious run (longer training, ~3.05x compression rate):
+Final training profile (requested):
 
 ```bash
 python training/train_global.py \
@@ -61,7 +48,7 @@ python training/train_global.py --auto-resume \
   --prefetch-factor 4
 ```
 
-_Note: use `tmux` if uninterrputed training is desired_
+_Note: use `tmux` if uninterrupted training is desired._
 
 
 Checkpoint outputs:
@@ -74,11 +61,30 @@ Checkpoint outputs:
 ### 3. Build submission zip
 
 ```bash
-python compress.py --model resource/model.pt --output submission.zip --device auto
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+python compress.py \
+  --model resource/model.pt \
+  --global-freq resource/global_freq.npy \
+  --splits data-0000.tar.gz data-0001.tar.gz \
+  --output compression_challenge_submission.zip \
+  --device cuda \
+  --encode-batch 512 \
+  --coder-threads 24
 ```
 
 ### 4. Evaluate
 
 ```bash
-bash test/evaluate.sh submission.zip
+DECOMPRESS_DEVICE=cuda DECODE_BATCH=512 \
+bash test/evaluate.sh compression_challenge_submission.zip
+```
+
+### 5. If evaluator path fails due to decode mismatch
+
+Patch only the decompressor in an already-built zip (no recompression):
+
+```bash
+zip -u compression_challenge_submission.zip decompress.py
+DECOMPRESS_DEVICE=cuda DECODE_BATCH=512 \
+bash test/evaluate.sh compression_challenge_submission.zip
 ```

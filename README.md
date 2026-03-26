@@ -1,41 +1,42 @@
-# Commavq Video Compression Challenge
+# Commavq Compression Challenge
 
-Lossless compression of [commaVQ](https://huggingface.co/datasets/commaai/commavq) HuggingFace dashcam token sequences for comma.ai challenge evaluation.
+Lossless compression pipeline for [commaai/commavq](https://huggingface.co/datasets/commaai/commavq).
 
-Overall performance of **2.96x overall compression** with training parameters specified in `docs`. 
+Current validated result on the official evaluation path (`data-0000` + `data-0001`):
 
-Available on HuggingFace: [SAT-oO/commavq_compression](https://huggingface.co/SAT-oO/commavq_compression/tree/main)
+- Data-only rate (`compressed_data.pkl`): ~`3.05x`
+- Overall submission rate (`submission.zip`): ~`2.96x` (prints as `3.0`)
 
 ## Active pipeline
 
-The maintained end-to-end path is:
+- `training/train_global.py` — train predictor, export model/frequency files, write checkpoints.
+- `model.py` — `NextFramePredictor` transformer (~4.48M params, 8-frame context).
+- `coder.py` — deterministic `constriction` range coding wrappers.
+- `compress.py` — build submission archive.
+- `decompress.py` — evaluator-compatible reconstruction script.
+- `test/evaluate.sh` + `test/evaluate.py` — official local validation path.
 
-- `training/train_global.py` — train next-frame predictor + checkpoints
-- `model.py` — 4.48M parameter transformer (`8` frame context)
-- `coder.py` — range coding wrappers (`constriction`)
-- `compress.py` — build submission zip
-- `decompress.py` — reconstruct tokens in evaluator
-- `test/evaluate.sh` + `test/evaluate.py` — correctness + ratio check
+Legacy/unused code paths are kept in `legacy/`.
 
-Legacy/unused approaches are in `legacy/`.
+## Core artifacts
 
-## Output artifacts
-
-Training outputs:
+Training artifacts:
 
 - `resource/model.pt`
 - `resource/model_f16.pt`
 - `resource/global_freq.npy`
 - `resource/checkpoints/*.pt`
 
-Submission output:
+Submission archive contents:
 
-- `submission.zip` (or custom `--output`)
+- `decompress.py`
+- `model.py`
+- `coder.py`
+- `model_weights.pt`
+- `global_freq.npy`
+- `compressed_data.pkl`
 
-## Notes
+## Where to start
 
-- Training and evaluation download data from Hugging Face directly.
-- Manual local shard copies are optional.
-- `compress.py` can be memory-heavy on CPU; prefer CUDA for packaging.
-- Implementation details: `docs/TECHNICAL_OVERVIEW.md`.
-- To replicate trainig workflow: see `docs/QUICK_START.md`
+- Quick runbook: `docs/QUICK_START.md`
+- Technical details: `docs/TECHNICAL_OVERVIEW.md`
