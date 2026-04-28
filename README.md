@@ -1,6 +1,6 @@
 # Commavq Compression Challenge
 
-Lossless compression pipeline for [commaai/commavq](https://huggingface.co/datasets/commaai/commavq).
+Lossless compression pipeline for [commavq](https://github.com/commaai/commavq).
 
 Current validated result on the official evaluation path (`data-0000` + `data-0001`):
 
